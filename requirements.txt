@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+supabase
+qrcode[pil]
+Pillow
+python-multipart
+python-dotenv
