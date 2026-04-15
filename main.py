@@ -1,11 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import qrcode
 from PIL import Image, ImageDraw
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
-import io, os, re, uuid, smtplib
+import io, os, re, uuid, smtplib, ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -14,19 +14,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    value = os.getenv(name, default)
+    if value is None:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1].strip()
+    return value
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = env_str(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "y", "on"}
+
 # ── Supabase ──────────────────────────────────────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-LOGO_PATH   = os.getenv("LOGO_PATH", "logo.jpg")
-SMTP_HOST   = os.getenv("SMTP_HOST")
-SMTP_PORT   = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER   = os.getenv("SMTP_USER")
-SMTP_PASS   = os.getenv("SMTP_PASS")
-FROM_NAME   = os.getenv("FROM_NAME", "ScholarX")
-SMTP_TIMEOUT = float(os.getenv("SMTP_TIMEOUT", "20"))
+LOGO_PATH    = env_str("LOGO_PATH", "logo.jpg")
+SMTP_HOST    = env_str("SMTP_HOST")
+SMTP_PORT    = int(env_str("SMTP_PORT", "465") or "465")
+SMTP_USER    = env_str("SMTP_USER")
+SMTP_PASS    = env_str("SMTP_PASS")
+SMTP_FROM    = env_str("SMTP_FROM")
+FROM_NAME    = env_str("FROM_NAME", "ScholarX") or "ScholarX"
+SMTP_TIMEOUT = float(env_str("SMTP_TIMEOUT", "20") or "20")
+SMTP_SECURE  = env_bool("SMTP_SECURE", SMTP_PORT == 465)
 
 app = FastAPI(title="ScholarX Registration API")
 
@@ -171,7 +188,8 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     )
 
     msg = MIMEMultipart()
-    msg["From"]    = f"{FROM_NAME} <{SMTP_USER}>"
+    from_address = SMTP_FROM or f"{FROM_NAME} <{SMTP_USER}>"
+    msg["From"]    = from_address
     msg["To"]      = to_email
     msg["Subject"] = "Your QR Code Ticket for Next Scholar Summit"
     msg.attach(MIMEText(body, "plain"))
@@ -180,7 +198,19 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     img_part.add_header("Content-Disposition", "attachment", filename="qrcode.png")
     msg.attach(img_part)
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("Missing SMTP config: SMTP_HOST/SMTP_USER/SMTP_PASS")
+
+    if SMTP_SECURE:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, to_email, msg.as_string())
+        return
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, to_email, msg.as_string())
 
