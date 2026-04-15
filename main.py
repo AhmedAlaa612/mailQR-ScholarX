@@ -5,7 +5,7 @@ import qrcode
 from PIL import Image, ImageDraw
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
-import io, os, re, uuid, smtplib, socket, ssl
+import io, os, re, uuid, smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -89,15 +89,6 @@ def clean_national_id(raw: Optional[str]) -> Optional[str]:
         return None
     digits = re.sub(r"\D", "", raw.strip())
     return digits if len(digits) == 14 else None
-
-def resolve_ipv4_host(host: str) -> str:
-    try:
-        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-        if infos:
-            return infos[0][4][0]
-    except socket.gaierror:
-        pass
-    return host
 
 def find_existing_registration(email: str, national_id: Optional[str], phone: Optional[str]):
     res = supabase.table("registrations").select("id").eq("email", email).execute()
@@ -189,29 +180,9 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     img_part.add_header("Content-Disposition", "attachment", filename="qrcode.png")
     msg.attach(img_part)
 
-    smtp_host = resolve_ipv4_host(SMTP_HOST)
-    last_error = None
-
-    try:
-        with smtplib.SMTP_SSL(smtp_host, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, to_email, msg.as_string())
-            return
-    except Exception as exc:
-        last_error = exc
-
-    try:
-        with smtplib.SMTP(smtp_host, 587, timeout=SMTP_TIMEOUT) as server:
-            server.ehlo()
-            server.starttls(context=ssl.create_default_context())
-            server.ehlo()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, to_email, msg.as_string())
-            return
-    except Exception as exc:
-        last_error = exc
-
-    raise last_error
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, to_email, msg.as_string())
 
 # ── Main endpoint ─────────────────────────────────────────────────────────────
 
