@@ -5,7 +5,7 @@ import qrcode
 from PIL import Image, ImageDraw
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
-import tempfile, os, re, uuid, smtplib
+import io, os, re, uuid, smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -21,14 +21,12 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LOGO_PATH   = os.getenv("LOGO_PATH", "logo.jpg")
-QR_DIR      = os.getenv("QR_DIR", "qr_codes")
 SMTP_HOST   = os.getenv("SMTP_HOST")
 SMTP_PORT   = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER   = os.getenv("SMTP_USER")
 SMTP_PASS   = os.getenv("SMTP_PASS")
 FROM_NAME   = os.getenv("FROM_NAME", "ScholarX")
-
-os.makedirs(QR_DIR, exist_ok=True)
+SMTP_TIMEOUT = float(os.getenv("SMTP_TIMEOUT", "20"))
 
 app = FastAPI(title="ScholarX Registration API")
 
@@ -92,6 +90,23 @@ def clean_national_id(raw: Optional[str]) -> Optional[str]:
     digits = re.sub(r"\D", "", raw.strip())
     return digits if len(digits) == 14 else None
 
+def find_existing_registration(email: str, national_id: Optional[str], phone: Optional[str]):
+    res = supabase.table("registrations").select("id").eq("email", email).execute()
+    if res.data:
+        return res.data[0]
+
+    if national_id:
+        res = supabase.table("registrations").select("id").eq("national_id", national_id).execute()
+        if res.data:
+            return res.data[0]
+
+    if phone:
+        res = supabase.table("registrations").select("id").eq("phone", phone).execute()
+        if res.data:
+            return res.data[0]
+
+    return None
+
 # ── QR Generator ─────────────────────────────────────────────────────────────
 
 def make_rounded_logo(path: str, corner_radius_ratio: float = 0.2) -> Image.Image:
@@ -103,8 +118,8 @@ def make_rounded_logo(path: str, corner_radius_ratio: float = 0.2) -> Image.Imag
     logo.putalpha(mask)
     return logo
 
-def generate_qr(row_id: str, name: str, email: str, phone: str) -> str:
-    data = f"{row_id},{name},{email},{phone}"
+def generate_qr_bytes(row_id: str, name: str, email: str, phone: Optional[str]) -> bytes:
+    data = f"{row_id},{name},{email},{phone or ''}"
 
     qr = qrcode.QRCode(
         version=None,
@@ -115,34 +130,38 @@ def generate_qr(row_id: str, name: str, email: str, phone: str) -> str:
     qr.add_data(data)
     qr.make(fit=True)
 
-    # Logo — gracefully skip if file missing
+    # Prefer styled QR, but gracefully fall back to plain QR if rendering fails.
+    img = None
     if os.path.exists(LOGO_PATH):
-        rounded_logo = make_rounded_logo(LOGO_PATH)
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        rounded_logo.save(tmp.name)
-        tmp.close()
         try:
+            rounded_logo = make_rounded_logo(LOGO_PATH)
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            rounded_logo.save(tmp_path)
+
             img = qr.make_image(
                 image_factory=StyledPilImage,
                 module_drawer=RoundedModuleDrawer(),
-                embeded_image_path=tmp.name,
+                embeded_image_path=tmp_path,
                 embedded_image_ratio=0.25,
             )
-        finally:
-            os.unlink(tmp.name)
-    else:
-        img = qr.make_image(
-            image_factory=StyledPilImage,
-            module_drawer=RoundedModuleDrawer(),
-        )
+            os.unlink(tmp_path)
+        except Exception as e:
+            print(f"Logo embedding failed: {e}")
+            img = None
 
-    qr_path = os.path.join(QR_DIR, f"{row_id}.png")
-    img.save(qr_path)
-    return qr_path
+    if img is None:
+        img = qr.make_image(fill_color="black", back_color="white")
+
+    out = io.BytesIO()
+    pil_img = img.get_image() if hasattr(img, "get_image") else img
+    pil_img.save(out, format="PNG")
+    return out.getvalue()
 
 # ── Email Sender ──────────────────────────────────────────────────────────────
 
-def send_email(to_email: str, first_name: str, qr_path: str):
+def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     body = (
         f"Hey {first_name}, thanks for registering for the Next Scholar Summit!\n\n"
         f"We'll see you on May 1st at Nile University. Your QR code is attached — "
@@ -157,12 +176,11 @@ def send_email(to_email: str, first_name: str, qr_path: str):
     msg["Subject"] = "Your QR Code Ticket for Next Scholar Summit"
     msg.attach(MIMEText(body, "plain"))
 
-    with open(qr_path, "rb") as f:
-        img_part = MIMEImage(f.read(), name="qrcode.png")
-        img_part.add_header("Content-Disposition", "attachment", filename="qrcode.png")
-        msg.attach(img_part)
+    img_part = MIMEImage(qr_bytes, name="qrcode.png")
+    img_part.add_header("Content-Disposition", "attachment", filename="qrcode.png")
+    msg.attach(img_part)
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, to_email, msg.as_string())
 
@@ -177,54 +195,38 @@ async def register(payload: RegistrationPayload):
     national_id = clean_national_id(payload.national_id)
     first_name  = name.split()[0]
 
-    if not phone:
-        raise HTTPException(status_code=422, detail=f"Could not parse phone number: '{payload.phone}'")
+    # 2. Insert or update Supabase
+    existing = find_existing_registration(email, national_id, phone)
+    is_update = existing is not None
+    row_id = existing["id"] if is_update else str(uuid.uuid4())
 
-    # 2. Deduplicate — check by national_id OR email
-    existing = None
-    if national_id:
-        res = supabase.table("registrations").select("id").eq("national_id", national_id).execute()
-        if res.data:
-            existing = res.data[0]
-    if not existing:
-        res = supabase.table("registrations").select("id").eq("email", email).execute()
-        if res.data:
-            existing = res.data[0]
-
-    if existing:
-        return {"status": "already_registered", "message": "This person is already registered.", "id": existing["id"]}
-
-    # 3. Insert to Supabase
-    row_id = str(uuid.uuid4())
-    supabase.table("registrations").insert({
+    payload_data = {
         "id":          row_id,
         "name":        name,
         "email":       email,
         "phone":       phone,
         "national_id": national_id,
         "qr_sent":     False,
-    }).execute()
+    }
+
+    if is_update:
+        supabase.table("registrations").update(payload_data).eq("id", row_id).execute()
+    else:
+        supabase.table("registrations").insert(payload_data).execute()
 
     # 4. Generate QR
-    qr_path = generate_qr(row_id, name, email, phone)
+    qr_bytes = generate_qr_bytes(row_id, name, email, phone)
 
     # 5. Send email
     try:
-        send_email(email, first_name, qr_path)
+        send_email(email, first_name, qr_bytes)
         supabase.table("registrations").update({"qr_sent": True}).eq("id", row_id).execute()
         email_status = "sent"
     except Exception as e:
         email_status = f"failed: {str(e)}"
-    finally:
-        # Keep storage clean by removing the generated QR file after use.
-        if os.path.exists(qr_path):
-            try:
-                os.remove(qr_path)
-            except OSError:
-                pass
 
     return {
-        "status":       "registered",
+        "status":       "updated" if is_update else "registered",
         "message":      f"Registered successfully. Email: {email_status}",
         "id":           row_id,
         "cleaned": {
