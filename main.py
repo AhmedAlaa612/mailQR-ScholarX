@@ -184,7 +184,7 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes):
         f"We'll see you on May 1st at Nile University. Your QR code is attached — "
         f"have it ready at the event.\n\n"
         f"Join the summit's WhatsApp group:\n"
-        f"https://chat.whatsapp.com/FCbd5QvoiCu6UDv6u6rJ3W?mode=gi_t"
+        f"https://chat.whatsapp.com/L3XSaxh6EzIHThMmo013El?mode=gi_t"
     )
 
     msg = MIMEMultipart()
