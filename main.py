@@ -108,17 +108,17 @@ def clean_national_id(raw: Optional[str]) -> Optional[str]:
     return digits if len(digits) == 14 else None
 
 def find_existing_registration(email: str, national_id: Optional[str], phone: Optional[str]):
-    res = supabase.table("registrations").select("id").eq("email", email).execute()
+    res = supabase.table("confirmed_registrations").select("id").eq("email", email).execute()
     if res.data:
         return res.data[0]
 
     if national_id:
-        res = supabase.table("registrations").select("id").eq("national_id", national_id).execute()
+        res = supabase.table("confirmed_registrations").select("id").eq("national_id", national_id).execute()
         if res.data:
             return res.data[0]
 
     if phone:
-        res = supabase.table("registrations").select("id").eq("phone", phone).execute()
+        res = supabase.table("confirmed_registrations").select("id").eq("phone", phone).execute()
         if res.data:
             return res.data[0]
 
@@ -181,10 +181,10 @@ def generate_qr_bytes(row_id: str, name: str, email: str, phone: Optional[str]) 
 def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     body = (
         f"Hey {first_name}, thanks for registering for the Next Scholar Summit!\n\n"
-        f"We'll see you on May 1st at Nile University. Your QR code is attached — "
+        f"Your QR code is attached — "
         f"have it ready at the event.\n\n"
         f"Join the summit's WhatsApp group:\n"
-        f"https://chat.whatsapp.com/KkwdScw2zsw0OkwS8yiprk"
+        f"https://chat.whatsapp.com/IVisGLTmpHxHwUAibYSCvw"
     )
 
     msg = MIMEMultipart()
@@ -240,9 +240,9 @@ async def register(payload: RegistrationPayload):
     }
 
     if is_update:
-        supabase.table("registrations").update(payload_data).eq("id", row_id).execute()
+        supabase.table("confirmed_registrations").update(payload_data).eq("id", row_id).execute()
     else:
-        supabase.table("registrations").insert(payload_data).execute()
+        supabase.table("confirmed_registrations").insert(payload_data).execute()
 
     # 4. Generate QR
     qr_bytes = generate_qr_bytes(row_id, name, email, phone)
@@ -250,7 +250,7 @@ async def register(payload: RegistrationPayload):
     # 5. Send email
     try:
         send_email(email, first_name, qr_bytes)
-        supabase.table("registrations").update({"qr_sent": True}).eq("id", row_id).execute()
+        supabase.table("confirmed_registrations").update({"qr_sent": True}).eq("id", row_id).execute()
         email_status = "sent"
     except Exception as e:
         email_status = f"failed: {str(e)}"
