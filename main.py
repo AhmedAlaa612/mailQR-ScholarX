@@ -229,6 +229,8 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     body = (
         f"Hey {first_name}, thanks for registering for the Next Scholar Summit!\n\n"
         f"Your QR code is attached — keep it ready at the event entrance.\n\n"
+        f"Don't forget to join the event's WhatsApp group for updates and announcements:\n"
+        f"https://chat.whatsapp.com/FNlatguGZyw6GtmfsnzbA9\n\n"
         f"See you there,\n"
         f"ScholarX Team"
     )
@@ -324,6 +326,7 @@ def admin_stats(_=Depends(require_admin)):
         supabase.table("event_participants")
         .select("id, qr_sent, registered_at, participants(city)")
         .eq("event_id", EVENT_ID)
+        .limit(10000)
         .execute()
         .data
     )
@@ -359,6 +362,7 @@ def admin_registrations(_=Depends(require_admin)):
         .select("id, qr_sent, registered_at, source, participants(id, first_name, last_name, email, phone, national_id, city, affiliation)")
         .eq("event_id", EVENT_ID)
         .order("registered_at", desc=True)
+        .limit(10000)
         .execute()
         .data
     )
