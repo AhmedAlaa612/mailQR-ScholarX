@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional
 import qrcode
@@ -46,6 +47,7 @@ FROM_NAME    = env_str("FROM_NAME", "ScholarX") or "ScholarX"
 SMTP_TIMEOUT = float(env_str("SMTP_TIMEOUT", "20") or "20")
 SMTP_SECURE  = env_bool("SMTP_SECURE", SMTP_PORT == 465)
 EVENT_ID     = env_str("EVENT_ID")   # V1 event uuid from Supabase
+ADMIN_KEY    = env_str("ADMIN_KEY")
 
 app = FastAPI(title="ScholarX Registration API")
 
@@ -295,3 +297,82 @@ async def register(payload: RegistrationPayload):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# ── Admin auth ────────────────────────────────────────────────
+
+def require_admin(x_admin_key: Optional[str] = Header(None)):
+    if not ADMIN_KEY or x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ── Admin endpoints ───────────────────────────────────────────
+
+@app.get("/api/admin/stats")
+def admin_stats(_=Depends(require_admin)):
+    rows = (
+        supabase.table("event_participants")
+        .select("id, qr_sent, registered_at, participants(city)")
+        .eq("event_id", EVENT_ID)
+        .execute()
+        .data
+    )
+
+    total   = len(rows)
+    sent    = sum(1 for r in rows if r.get("qr_sent"))
+    pending = total - sent
+
+    city_counts: dict = {}
+    for r in rows:
+        city = ((r.get("participants") or {}).get("city") or "Unknown").strip() or "Unknown"
+        city_counts[city] = city_counts.get(city, 0) + 1
+    by_city = sorted(
+        [{"city": k, "count": v} for k, v in city_counts.items()],
+        key=lambda x: -x["count"]
+    )
+
+    day_counts: dict = {}
+    for r in rows:
+        day = (r.get("registered_at") or "")[:10]
+        if day:
+            day_counts[day] = day_counts.get(day, 0) + 1
+    by_day = sorted([{"date": k, "count": v} for k, v in day_counts.items()])
+
+    return {"total": total, "qr_sent": sent, "pending": pending,
+            "by_city": by_city, "by_day": by_day}
+
+
+@app.get("/api/admin/registrations")
+def admin_registrations(_=Depends(require_admin)):
+    data = (
+        supabase.table("event_participants")
+        .select("id, qr_sent, registered_at, source, participants(id, first_name, last_name, email, phone, national_id, city, affiliation)")
+        .eq("event_id", EVENT_ID)
+        .order("registered_at", desc=True)
+        .execute()
+        .data
+    )
+    return {"data": data, "count": len(data)}
+
+
+@app.get("/api/admin/qr/{ep_id}")
+def admin_qr(ep_id: str, _=Depends(require_admin)):
+    ep = supabase.table("event_participants").select("participant_id").eq("id", ep_id).single().execute()
+    if not ep.data:
+        raise HTTPException(status_code=404, detail="Registration not found")
+
+    p = supabase.table("participants").select("first_name, last_name, email, phone").eq("id", ep.data["participant_id"]).single().execute()
+    if not p.data:
+        raise HTTPException(status_code=404, detail="Participant not found")
+
+    d = p.data
+    qr_bytes = generate_qr_bytes(
+        ep_id,
+        d.get("first_name") or "",
+        d.get("last_name")  or "",
+        d.get("email")      or "",
+        d.get("phone"),
+    )
+    return Response(
+        content=qr_bytes,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="ticket-{ep_id[:8]}.png"'},
+    )
