@@ -143,18 +143,30 @@ def upsert_participant(first_name: str, last_name: str, email: str,
     return participant_id
 
 def create_event_participant(participant_id: str, event_id: str) -> str:
-    """Insert event_participant row. Returns event_participant id."""
-    ep_id = str(uuid.uuid4())
-    supabase.table("event_participants").insert({
-        "id":             ep_id,
+    """Insert event_participant row, returning existing id if already registered."""
+    res = supabase.table("event_participants").upsert({
+        "id":             str(uuid.uuid4()),
         "event_id":       event_id,
         "participant_id": participant_id,
         "role":           "attendee",
         "status":         "registered",
         "source":         "google_form",
         "qr_sent":        False,
-    }).execute()
-    return ep_id
+    }, on_conflict="event_id,participant_id", ignore_duplicates=True).execute()
+
+    if res.data:
+        return res.data[0]["id"]
+
+    # Already existed — fetch the existing ep_id
+    existing = (
+        supabase.table("event_participants")
+        .select("id")
+        .eq("event_id", event_id)
+        .eq("participant_id", participant_id)
+        .single()
+        .execute()
+    )
+    return existing.data["id"]
 
 def mark_qr_sent(ep_id: str):
     supabase.table("event_participants").update({"qr_sent": True}).eq("id", ep_id).execute()
