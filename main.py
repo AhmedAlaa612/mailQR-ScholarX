@@ -339,6 +339,7 @@ def admin_stats(_=Depends(require_admin)):
     for r in rows:
         city = ((r.get("participants") or {}).get("city") or "Unknown").strip() or "Unknown"
         city_counts[city] = city_counts.get(city, 0) + 1
+
     by_city = sorted(
         [{"city": k, "count": v} for k, v in city_counts.items()],
         key=lambda x: -x["count"]
@@ -349,10 +350,19 @@ def admin_stats(_=Depends(require_admin)):
         day = (r.get("registered_at") or "")[:10]
         if day:
             day_counts[day] = day_counts.get(day, 0) + 1
-    by_day = sorted([{"date": k, "count": v} for k, v in day_counts.items()])
 
-    return {"total": total, "qr_sent": sent, "pending": pending,
-            "by_city": by_city, "by_day": by_day}
+    by_day = [
+        {"date": k, "count": v}
+        for k, v in sorted(day_counts.items())
+    ]
+
+    return {
+        "total": total,
+        "qr_sent": sent,
+        "pending": pending,
+        "by_city": by_city,
+        "by_day": by_day,
+    }
 
 
 @app.get("/api/admin/registrations")
