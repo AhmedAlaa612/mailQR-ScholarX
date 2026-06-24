@@ -230,7 +230,7 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes):
         f"Hey {first_name}, thanks for registering for the Next Scholar Summit!\n\n"
         f"Your QR code is attached — keep it ready at the event entrance.\n\n"
         f"Don't forget to join the event's WhatsApp group for updates and announcements:\n"
-        f"https://chat.whatsapp.com/FNlatguGZyw6GtmfsnzbA9\n\n"
+        f"https://chat.whatsapp.com/DZtFtlvxBQxBu0drWdjzws\n\n"
         f"See you there,\n"
         f"ScholarX Team"
     )
