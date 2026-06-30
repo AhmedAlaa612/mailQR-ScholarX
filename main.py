@@ -315,12 +315,14 @@ def health():
 
 class TrackPayload(BaseModel):
     type: str = "download"  # download | share_facebook | share_instagram | share_linkedin | share_whatsapp | copy_linkedin | copy_social
+    session_id: Optional[str] = None
 
 @app.post("/api/card/track")
 def card_track(payload: TrackPayload = None):
     """Called by the card generator app on each action. No auth required."""
     event_type = (payload.type if payload else None) or "download"
-    supabase.table("card_downloads").insert({"type": event_type}).execute()
+    session_id = (payload.session_id if payload else None) or None
+    supabase.table("card_downloads").insert({"type": event_type, "session_id": session_id}).execute()
     return {"status": "ok"}
 
 # ── Admin auth ────────────────────────────────────────────────
@@ -380,7 +382,7 @@ def admin_stats(_=Depends(require_admin)):
 def admin_card_stats(_=Depends(require_admin)):
     rows = (
         supabase.table("card_downloads")
-        .select("downloaded_at, type")
+        .select("downloaded_at, type, session_id")
         .order("downloaded_at", desc=False)
         .limit(100000)
         .execute()
@@ -391,17 +393,35 @@ def admin_card_stats(_=Depends(require_admin)):
 
     day_counts: dict = {}
     type_counts: dict = {}
+    session_actions: dict = {}
+
     for r in rows:
         day = (r.get("downloaded_at") or "")[:10]
         if day:
             day_counts[day] = day_counts.get(day, 0) + 1
+
         t = r.get("type") or "download"
         type_counts[t] = type_counts.get(t, 0) + 1
+
+        sid = r.get("session_id")
+        if sid:
+            if sid not in session_actions:
+                session_actions[sid] = []
+            session_actions[sid].append(t)
+
+    unique_sessions = len(session_actions)
+    avg_actions = round(total / unique_sessions, 1) if unique_sessions > 0 else 0
 
     by_day  = [{"date": k, "count": v} for k, v in sorted(day_counts.items())]
     by_type = [{"type": k, "count": v} for k, v in sorted(type_counts.items(), key=lambda x: -x[1])]
 
-    return {"total": total, "by_day": by_day, "by_type": by_type}
+    return {
+        "total": total,
+        "unique_sessions": unique_sessions,
+        "avg_actions_per_session": avg_actions,
+        "by_day": by_day,
+        "by_type": by_type,
+    }
 
 
 @app.get("/api/admin/registrations")
