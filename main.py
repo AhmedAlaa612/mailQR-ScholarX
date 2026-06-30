@@ -312,6 +312,13 @@ async def register(payload: RegistrationPayload):
 def health():
     return {"status": "ok"}
 
+
+@app.post("/api/card/track")
+def card_track():
+    """Called by the card generator app on each download. No auth required."""
+    supabase.table("card_downloads").insert({}).execute()
+    return {"status": "ok"}
+
 # ── Admin auth ────────────────────────────────────────────────
 
 def require_admin(x_admin_key: Optional[str] = Header(None)):
@@ -363,6 +370,30 @@ def admin_stats(_=Depends(require_admin)):
         "by_city": by_city,
         "by_day": by_day,
     }
+
+
+@app.get("/api/admin/card-stats")
+def admin_card_stats(_=Depends(require_admin)):
+    rows = (
+        supabase.table("card_downloads")
+        .select("downloaded_at")
+        .order("downloaded_at", desc=False)
+        .limit(100000)
+        .execute()
+        .data
+    )
+
+    total = len(rows)
+
+    day_counts: dict = {}
+    for r in rows:
+        day = (r.get("downloaded_at") or "")[:10]
+        if day:
+            day_counts[day] = day_counts.get(day, 0) + 1
+
+    by_day = [{"date": k, "count": v} for k, v in sorted(day_counts.items())]
+
+    return {"total": total, "by_day": by_day}
 
 
 @app.get("/api/admin/registrations")
