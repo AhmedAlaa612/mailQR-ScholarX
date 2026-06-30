@@ -391,34 +391,49 @@ def admin_card_stats(_=Depends(require_admin)):
 
     total = len(rows)
 
-    day_counts: dict = {}
-    type_counts: dict = {}
-    session_actions: dict = {}
+    # Build per-session action list and first-seen day
+    session_actions: dict[str, list] = {}
+    session_first_day: dict[str, str] = {}
 
     for r in rows:
-        day = (r.get("downloaded_at") or "")[:10]
-        if day:
-            day_counts[day] = day_counts.get(day, 0) + 1
-
-        t = r.get("type") or "download"
-        type_counts[t] = type_counts.get(t, 0) + 1
-
         sid = r.get("session_id")
+        t   = r.get("type") or "download"
+        day = (r.get("downloaded_at") or "")[:10]
+
         if sid:
             if sid not in session_actions:
                 session_actions[sid] = []
+                if day:
+                    session_first_day[sid] = day
             session_actions[sid].append(t)
 
     unique_sessions = len(session_actions)
-    avg_actions = round(total / unique_sessions, 1) if unique_sessions > 0 else 0
+
+    # Sessions that did at least one copy AND at least one share
+    copy_and_share = sum(
+        1 for actions in session_actions.values()
+        if any(a.startswith("copy_") for a in actions)
+        and any(a.startswith("share_") for a in actions)
+    )
+
+    # Unique sessions per day (keyed by first action date)
+    day_counts: dict = {}
+    for day in session_first_day.values():
+        day_counts[day] = day_counts.get(day, 0) + 1
+
+    # Unique sessions per action type (each session counted once per type)
+    type_session_counts: dict = {}
+    for actions in session_actions.values():
+        for t in set(actions):
+            type_session_counts[t] = type_session_counts.get(t, 0) + 1
 
     by_day  = [{"date": k, "count": v} for k, v in sorted(day_counts.items())]
-    by_type = [{"type": k, "count": v} for k, v in sorted(type_counts.items(), key=lambda x: -x[1])]
+    by_type = [{"type": k, "count": v} for k, v in sorted(type_session_counts.items(), key=lambda x: -x[1])]
 
     return {
         "total": total,
         "unique_sessions": unique_sessions,
-        "avg_actions_per_session": avg_actions,
+        "copy_and_share": copy_and_share,
         "by_day": by_day,
         "by_type": by_type,
     }
