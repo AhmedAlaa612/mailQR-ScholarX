@@ -142,7 +142,7 @@ def upsert_participant(first_name: str, last_name: str, email: str,
 
     return participant_id
 
-def create_event_participant(participant_id: str, event_id: str) -> str:
+def create_event_participant(participant_id: str, event_id: str, source: str = "google_form") -> str:
     """Insert event_participant row, returning existing id if already registered."""
     res = supabase.table("event_participants").upsert({
         "id":             str(uuid.uuid4()),
@@ -150,7 +150,7 @@ def create_event_participant(participant_id: str, event_id: str) -> str:
         "participant_id": participant_id,
         "role":           "attendee",
         "status":         "registered",
-        "source":         "google_form",
+        "source":         source,
         "qr_sent":        False,
     }, on_conflict="event_id,participant_id", ignore_duplicates=True).execute()
 
@@ -476,3 +476,243 @@ def admin_qr(ep_id: str, _=Depends(require_admin)):
         media_type="image/png",
         headers={"Content-Disposition": f'attachment; filename="ticket-{ep_id[:8]}.png"'},
     )
+
+
+# ── Check-in app additions (developer-plan.md) ───────────────────
+
+import asyncio
+from collections import defaultdict
+
+
+class CheckpointCreate(BaseModel):
+    label: str
+    mode: str                      # must be 'gate' or 'room' — reject otherwise (422)
+
+
+class VolunteerCreate(BaseModel):
+    email: str
+    password: str
+    display_name: str
+    checkpoint_id: Optional[str] = None
+    role: str = "scanner"
+
+
+class VolunteerUpdate(BaseModel):  # PATCH semantics: only provided fields change
+    display_name: Optional[str] = None
+    checkpoint_id: Optional[str] = None
+    role: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class PasswordBody(BaseModel):
+    password: str
+
+
+@app.get("/api/admin/checkpoints")
+def list_checkpoints(_=Depends(require_admin)):
+    return supabase.table("checkpoints").select("*").order("label").execute().data
+
+
+@app.post("/api/admin/checkpoints")
+def create_checkpoint(body: CheckpointCreate, _=Depends(require_admin)):
+    if body.mode not in ("gate", "room"):
+        raise HTTPException(422, "mode must be 'gate' or 'room'")
+    res = supabase.table("checkpoints").insert(
+        {"label": body.label, "mode": body.mode}).execute()
+    return res.data[0]
+# NOTE: no update/delete endpoints for checkpoints. Intentional. Do not add them.
+
+
+@app.get("/api/admin/volunteers")
+def list_volunteers(_=Depends(require_admin)):
+    vols = supabase.table("volunteers").select("*").order("display_name").execute().data
+    cps  = {c["id"]: c for c in supabase.table("checkpoints").select("*").execute().data}
+    for v in vols:
+        v["checkpoint"] = cps.get(v["checkpoint_id"])   # {id,label,mode} or None
+    return vols
+
+
+@app.post("/api/admin/volunteers")
+def create_volunteer(body: VolunteerCreate, _=Depends(require_admin)):
+    u = supabase.auth.admin.create_user({
+        "email": body.email, "password": body.password, "email_confirm": True})
+    supabase.table("volunteers").insert({
+        "id": u.user.id, "email": body.email, "display_name": body.display_name,
+        "checkpoint_id": body.checkpoint_id, "role": body.role}).execute()
+    return {"id": u.user.id}
+
+
+@app.patch("/api/admin/volunteers/{vid}")
+def update_volunteer(vid: str, body: VolunteerUpdate, _=Depends(require_admin)):
+    supabase.table("volunteers").update(
+        body.dict(exclude_none=True)).eq("id", vid).execute()
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/volunteers/{vid}/password")
+def reset_password(vid: str, body: PasswordBody, _=Depends(require_admin)):
+    supabase.auth.admin.update_user_by_id(vid, {"password": body.password})
+    return {"status": "ok"}
+
+
+@app.get("/api/admin/checkin-stats")
+def checkin_stats(_=Depends(require_admin)):
+    if not EVENT_ID:
+        return {"status": "error", "message": "EVENT_ID not configured"}
+
+    rows = (
+        supabase.table("checkins")
+        .select("*")
+        .eq("event_id", EVENT_ID)
+        .limit(20000)
+        .execute()
+        .data
+    )
+    checkpoints = {c["id"]: c for c in supabase.table("checkpoints").select("*").execute().data}
+    volunteers  = {v["id"]: v for v in supabase.table("volunteers").select("*").execute().data}
+
+    total_registered = len(
+        supabase.table("event_participants").select("id").eq("event_id", EVENT_ID)
+        .limit(20000).execute().data
+    )
+
+    gate_unique_eps = set()
+    walkin_unpromoted = 0
+    duplicates = 0
+    walkin_count = 0
+    search_count = 0
+
+    per_checkpoint_scans: dict = defaultdict(int)
+    per_checkpoint_unique: dict = defaultdict(set)
+    per_volunteer_scans: dict = defaultdict(int)
+    per_volunteer_last_sync: dict = {}
+    arrivals_buckets: dict = defaultdict(int)
+    walkins_feed = []
+
+    for r in rows:
+        cp = checkpoints.get(r.get("checkpoint_id"))
+        ep_id = r.get("event_participant_id")
+        kind = r.get("kind")
+
+        if kind == "duplicate_override":
+            duplicates += 1
+        if kind == "walkin":
+            walkin_count += 1
+            if ep_id is None:
+                walkin_unpromoted += 1
+        if kind == "search":
+            search_count += 1
+
+        if cp and cp.get("mode") == "gate" and ep_id is not None:
+            gate_unique_eps.add(ep_id)
+
+        if r.get("checkpoint_id"):
+            cpid = r["checkpoint_id"]
+            per_checkpoint_scans[cpid] += 1
+            per_checkpoint_unique[cpid].add(ep_id)
+
+        vid = r.get("volunteer_id")
+        if vid:
+            per_volunteer_scans[vid] += 1
+            received_at = r.get("received_at")
+            if received_at and (vid not in per_volunteer_last_sync
+                                 or received_at > per_volunteer_last_sync[vid]):
+                per_volunteer_last_sync[vid] = received_at
+
+        if cp and cp.get("mode") == "gate" and r.get("scanned_at"):
+            ts = r["scanned_at"]
+            bucket_minute = (int(ts[14:16]) // 15) * 15
+            bucket_key = f"{ts[:14]}{bucket_minute:02d}:00"
+            arrivals_buckets[bucket_key] += 1
+
+        if kind == "walkin":
+            volunteer = volunteers.get(vid)
+            walkins_feed.append({
+                "name": r.get("walkin_name"),
+                "by": volunteer.get("display_name") if volunteer else None,
+                "checkpoint": cp.get("label") if cp else None,
+                "at": r.get("scanned_at"),
+                "promoted": ep_id is not None,
+            })
+
+    unique_inside = len(gate_unique_eps) + walkin_unpromoted
+
+    per_checkpoint = [
+        {
+            "checkpoint_id": cpid,
+            "label": checkpoints.get(cpid, {}).get("label"),
+            "mode": checkpoints.get(cpid, {}).get("mode"),
+            "scans": per_checkpoint_scans[cpid],
+            "unique": len(per_checkpoint_unique[cpid]),
+        }
+        for cpid in per_checkpoint_scans
+    ]
+
+    per_volunteer = [
+        {
+            "volunteer_id": vid,
+            "display_name": volunteers.get(vid, {}).get("display_name"),
+            "checkpoint_label": checkpoints.get(volunteers.get(vid, {}).get("checkpoint_id"), {}).get("label"),
+            "scans": per_volunteer_scans[vid],
+            "last_sync": per_volunteer_last_sync.get(vid),
+        }
+        for vid in per_volunteer_scans
+    ]
+
+    arrivals_curve = [
+        {"t": t, "count": c} for t, c in sorted(arrivals_buckets.items())
+    ]
+
+    walkins_feed.sort(key=lambda w: w["at"] or "", reverse=True)
+
+    return {
+        "unique_inside": unique_inside,
+        "total_scans": len(rows),
+        "duplicates": duplicates,
+        "walkin_count": walkin_count,
+        "search_count": search_count,
+        "attendance_rate": (unique_inside / total_registered) if total_registered else 0,
+        "per_checkpoint": per_checkpoint,
+        "per_volunteer": per_volunteer,
+        "arrivals_curve": arrivals_curve,
+        "walkins": walkins_feed,
+    }
+
+
+def process_walkins() -> int:
+    pending = (supabase.table("checkins").select("*")
+        .eq("event_id", EVENT_ID).eq("kind", "walkin")
+        .is_("event_participant_id", "null").execute().data)
+    for w in pending:
+        email = clean_email(w["walkin_email"] or "")
+        phone = clean_phone(w["walkin_phone"] or "")
+        nid   = clean_national_id(w["walkin_national_id"])
+        first, last = split_name(w["walkin_name"] or "")
+        pid   = upsert_participant(first, last, email, phone, nid, None, None)
+        ep_id = create_event_participant(pid, EVENT_ID, source="walkin")
+        supabase.table("checkins").update(
+            {"event_participant_id": ep_id}).eq("id", w["id"]).execute()
+        try:
+            qr = generate_qr_bytes(ep_id, first, last, email, phone)
+            send_email(email, first, qr)
+            mark_qr_sent(ep_id)
+        except Exception as e:
+            print(f"walk-in QR email failed for {email}: {e}")   # never blocks promotion
+    return len(pending)
+
+
+@app.on_event("startup")
+async def walkin_promoter():
+    async def loop():
+        while True:
+            try:
+                await asyncio.to_thread(process_walkins)
+            except Exception as e:
+                print(f"walkin promoter: {e}")
+            await asyncio.sleep(45)
+    asyncio.create_task(loop())
+
+
+@app.post("/api/admin/process-walkins")
+def process_walkins_now(_=Depends(require_admin)):
+    return {"processed": process_walkins()}
