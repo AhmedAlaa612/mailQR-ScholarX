@@ -482,6 +482,8 @@ def admin_qr(ep_id: str, _=Depends(require_admin)):
 
 import asyncio
 from collections import defaultdict
+from postgrest.exceptions import APIError as PostgrestAPIError
+from supabase_auth.errors import AuthApiError
 
 
 class CheckpointCreate(BaseModel):
@@ -517,8 +519,11 @@ def list_checkpoints(_=Depends(require_admin)):
 def create_checkpoint(body: CheckpointCreate, _=Depends(require_admin)):
     if body.mode not in ("gate", "room"):
         raise HTTPException(422, "mode must be 'gate' or 'room'")
-    res = supabase.table("checkpoints").insert(
-        {"label": body.label, "mode": body.mode}).execute()
+    try:
+        res = supabase.table("checkpoints").insert(
+            {"label": body.label, "mode": body.mode}).execute()
+    except PostgrestAPIError as e:
+        raise HTTPException(422, getattr(e, "message", str(e)))
     return res.data[0]
 # NOTE: no update/delete endpoints for checkpoints. Intentional. Do not add them.
 
@@ -534,24 +539,36 @@ def list_volunteers(_=Depends(require_admin)):
 
 @app.post("/api/admin/volunteers")
 def create_volunteer(body: VolunteerCreate, _=Depends(require_admin)):
-    u = supabase.auth.admin.create_user({
-        "email": body.email, "password": body.password, "email_confirm": True})
-    supabase.table("volunteers").insert({
-        "id": u.user.id, "email": body.email, "display_name": body.display_name,
-        "checkpoint_id": body.checkpoint_id, "role": body.role}).execute()
+    try:
+        u = supabase.auth.admin.create_user({
+            "email": body.email, "password": body.password, "email_confirm": True})
+    except AuthApiError as e:
+        raise HTTPException(422, getattr(e, "message", str(e)))
+    try:
+        supabase.table("volunteers").insert({
+            "id": u.user.id, "email": body.email, "display_name": body.display_name,
+            "checkpoint_id": body.checkpoint_id, "role": body.role}).execute()
+    except PostgrestAPIError as e:
+        raise HTTPException(422, getattr(e, "message", str(e)))
     return {"id": u.user.id}
 
 
 @app.patch("/api/admin/volunteers/{vid}")
 def update_volunteer(vid: str, body: VolunteerUpdate, _=Depends(require_admin)):
-    supabase.table("volunteers").update(
-        body.dict(exclude_none=True)).eq("id", vid).execute()
+    try:
+        supabase.table("volunteers").update(
+            body.dict(exclude_none=True)).eq("id", vid).execute()
+    except PostgrestAPIError as e:
+        raise HTTPException(422, getattr(e, "message", str(e)))
     return {"status": "ok"}
 
 
 @app.post("/api/admin/volunteers/{vid}/password")
 def reset_password(vid: str, body: PasswordBody, _=Depends(require_admin)):
-    supabase.auth.admin.update_user_by_id(vid, {"password": body.password})
+    try:
+        supabase.auth.admin.update_user_by_id(vid, {"password": body.password})
+    except AuthApiError as e:
+        raise HTTPException(422, getattr(e, "message", str(e)))
     return {"status": "ok"}
 
 
