@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -480,7 +480,6 @@ def admin_qr(ep_id: str, _=Depends(require_admin)):
 
 # ── Check-in app additions (developer-plan.md) ───────────────────
 
-import asyncio
 from collections import defaultdict
 from postgrest.exceptions import APIError as PostgrestAPIError
 from supabase_auth.errors import AuthApiError
@@ -696,40 +695,58 @@ def checkin_stats(_=Depends(require_admin)):
     }
 
 
+def promote_walkin(row: dict) -> Optional[str]:
+    """Promote one walk-in checkins row to a real participant + send the QR
+    email. Returns the new event_participant_id, or None if this row was
+    already promoted (idempotent — safe if a webhook delivery repeats)."""
+    if row.get("event_participant_id") is not None:
+        return None
+
+    email = clean_email(row["walkin_email"] or "")
+    phone = clean_phone(row["walkin_phone"] or "")
+    nid   = clean_national_id(row["walkin_national_id"])
+    first, last = split_name(row["walkin_name"] or "")
+    pid   = upsert_participant(first, last, email, phone, nid, None, None)
+    ep_id = create_event_participant(pid, EVENT_ID, source="walkin")
+    supabase.table("checkins").update(
+        {"event_participant_id": ep_id}).eq("id", row["id"]).execute()
+    try:
+        qr = generate_qr_bytes(ep_id, first, last, email, phone)
+        send_email(email, first, qr)
+        mark_qr_sent(ep_id)
+    except Exception as e:
+        print(f"walk-in QR email failed for {email}: {e}")   # never blocks promotion
+    return ep_id
+
+
 def process_walkins() -> int:
+    """Manual/backstop sweep — promotes anything the webhook missed."""
     pending = (supabase.table("checkins").select("*")
         .eq("event_id", EVENT_ID).eq("kind", "walkin")
         .is_("event_participant_id", "null").execute().data)
     for w in pending:
-        email = clean_email(w["walkin_email"] or "")
-        phone = clean_phone(w["walkin_phone"] or "")
-        nid   = clean_national_id(w["walkin_national_id"])
-        first, last = split_name(w["walkin_name"] or "")
-        pid   = upsert_participant(first, last, email, phone, nid, None, None)
-        ep_id = create_event_participant(pid, EVENT_ID, source="walkin")
-        supabase.table("checkins").update(
-            {"event_participant_id": ep_id}).eq("id", w["id"]).execute()
-        try:
-            qr = generate_qr_bytes(ep_id, first, last, email, phone)
-            send_email(email, first, qr)
-            mark_qr_sent(ep_id)
-        except Exception as e:
-            print(f"walk-in QR email failed for {email}: {e}")   # never blocks promotion
+        promote_walkin(w)
     return len(pending)
-
-
-@app.on_event("startup")
-async def walkin_promoter():
-    async def loop():
-        while True:
-            try:
-                await asyncio.to_thread(process_walkins)
-            except Exception as e:
-                print(f"walkin promoter: {e}")
-            await asyncio.sleep(45)
-    asyncio.create_task(loop())
 
 
 @app.post("/api/admin/process-walkins")
 def process_walkins_now(_=Depends(require_admin)):
     return {"processed": process_walkins()}
+
+
+WEBHOOK_SECRET = env_str("WEBHOOK_SECRET")
+
+@app.post("/api/webhooks/checkin-walkin")
+async def checkin_walkin_webhook(request: Request):
+    """Supabase Database Webhook target: fires on every INSERT into
+    checkins. Promotes walk-in rows the instant they land — this replaces
+    the old in-process polling loop, which never actually ran on Vercel's
+    serverless (no persistent process to hold the timer)."""
+    if not WEBHOOK_SECRET or request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
+        raise HTTPException(401, "bad secret")
+    body = await request.json()
+    row = body.get("record") or {}
+    if body.get("type") != "INSERT" or row.get("kind") != "walkin":
+        return {"status": "skipped"}
+    ep_id = promote_walkin(row)
+    return {"status": "promoted" if ep_id else "already_promoted"}
