@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
 import io, os, re, uuid, smtplib, ssl
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -587,10 +588,15 @@ def checkin_stats(_=Depends(require_admin)):
     checkpoints = {c["id"]: c for c in supabase.table("checkpoints").select("*").execute().data}
     volunteers  = {v["id"]: v for v in supabase.table("volunteers").select("*").execute().data}
 
-    total_registered = len(
-        supabase.table("event_participants").select("id").eq("event_id", EVENT_ID)
+    ep_rows = (
+        supabase.table("event_participants")
+        .select("id, participants(city)")
+        .eq("event_id", EVENT_ID)
         .limit(20000).execute().data
     )
+    total_registered = len(ep_rows)
+    ep_city = {r["id"]: (r.get("participants") or {}).get("city") for r in ep_rows}
+    registered_ids = set(ep_city.keys())
 
     gate_unique_eps = set()
     walkin_unpromoted = 0
@@ -600,10 +606,16 @@ def checkin_stats(_=Depends(require_admin)):
 
     per_checkpoint_scans: dict = defaultdict(int)
     per_checkpoint_unique: dict = defaultdict(set)
+    per_checkpoint_pace: dict = defaultdict(int)
     per_volunteer_scans: dict = defaultdict(int)
     per_volunteer_last_sync: dict = {}
     arrivals_buckets: dict = defaultdict(int)
     walkins_feed = []
+    unlisted_feed = []
+
+    pace_threshold = (datetime.now(timezone.utc) - timedelta(minutes=15)) \
+        .strftime("%Y-%m-%dT%H:%M:%S")
+    pace_15min = 0
 
     for r in rows:
         cp = checkpoints.get(r.get("checkpoint_id"))
@@ -642,6 +654,9 @@ def checkin_stats(_=Depends(require_admin)):
             # instead of browser-local time.
             bucket_key = f"{ts[:14]}{bucket_minute:02d}:00Z"
             arrivals_buckets[bucket_key] += 1
+            if ts[:19] >= pace_threshold:
+                pace_15min += 1
+                per_checkpoint_pace[r["checkpoint_id"]] += 1
 
         if kind == "walkin":
             volunteer = volunteers.get(vid)
@@ -653,7 +668,31 @@ def checkin_stats(_=Depends(require_admin)):
                 "promoted": ep_id is not None,
             })
 
+        if kind == "qr_unlisted":
+            volunteer = volunteers.get(vid)
+            unlisted_feed.append({
+                "name": r.get("scanned_name"),
+                "by": volunteer.get("display_name") if volunteer else None,
+                "checkpoint": cp.get("label") if cp else None,
+                "at": r.get("scanned_at"),
+                "raw_payload": r.get("raw_payload"),
+            })
+
     unique_inside = len(gate_unique_eps) + walkin_unpromoted
+
+    # Admission mix: gate uniques split into roster members vs unknown-ticket
+    # let-ins (qr_unlisted with an ep_id not in this event, e.g. old-event QRs).
+    registered_inside = gate_unique_eps & registered_ids
+    unlisted_inside = gate_unique_eps - registered_ids
+
+    city_counts_in: dict = defaultdict(int)
+    for ep in registered_inside:
+        city = (ep_city.get(ep) or "Unknown").strip() or "Unknown"
+        city_counts_in[city] += 1
+    checkin_by_city = sorted(
+        [{"city": k, "count": v} for k, v in city_counts_in.items()],
+        key=lambda x: x["count"], reverse=True,
+    )
 
     per_checkpoint = [
         {
@@ -662,6 +701,7 @@ def checkin_stats(_=Depends(require_admin)):
             "mode": checkpoints.get(cpid, {}).get("mode"),
             "scans": per_checkpoint_scans[cpid],
             "unique": len(per_checkpoint_unique[cpid]),
+            "pace_15min": per_checkpoint_pace.get(cpid, 0),
         }
         for cpid in per_checkpoint_scans
     ]
@@ -682,6 +722,7 @@ def checkin_stats(_=Depends(require_admin)):
     ]
 
     walkins_feed.sort(key=lambda w: w["at"] or "", reverse=True)
+    unlisted_feed.sort(key=lambda u: u["at"] or "", reverse=True)
 
     return {
         "unique_inside": unique_inside,
@@ -689,11 +730,16 @@ def checkin_stats(_=Depends(require_admin)):
         "duplicates": duplicates,
         "walkin_count": walkin_count,
         "search_count": search_count,
+        "registered_inside": len(registered_inside),
+        "unlisted_inside": len(unlisted_inside),
+        "pace_15min": pace_15min,
         "attendance_rate": (unique_inside / total_registered) if total_registered else 0,
         "per_checkpoint": per_checkpoint,
         "per_volunteer": per_volunteer,
         "arrivals_curve": arrivals_curve,
         "walkins": walkins_feed,
+        "unlisted": unlisted_feed,
+        "checkin_by_city": checkin_by_city,
     }
 
 
