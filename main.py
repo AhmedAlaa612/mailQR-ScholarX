@@ -638,7 +638,9 @@ def checkin_stats(_=Depends(require_admin)):
         if cp and cp.get("mode") == "gate" and r.get("scanned_at"):
             ts = r["scanned_at"]
             bucket_minute = (int(ts[14:16]) // 15) * 15
-            bucket_key = f"{ts[:14]}{bucket_minute:02d}:00"
+            # scanned_at is UTC; keep the Z so the dashboard parses it as UTC
+            # instead of browser-local time.
+            bucket_key = f"{ts[:14]}{bucket_minute:02d}:00Z"
             arrivals_buckets[bucket_key] += 1
 
         if kind == "walkin":
