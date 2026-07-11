@@ -612,6 +612,7 @@ def checkin_stats(_=Depends(require_admin)):
     arrivals_buckets: dict = defaultdict(int)
     walkins_feed = []
     unlisted_feed = []
+    unlisted_noid = 0
 
     pace_threshold = (datetime.now(timezone.utc) - timedelta(minutes=15)) \
         .strftime("%Y-%m-%dT%H:%M:%S")
@@ -649,10 +650,9 @@ def checkin_stats(_=Depends(require_admin)):
 
         if cp and cp.get("mode") == "gate" and r.get("scanned_at"):
             ts = r["scanned_at"]
-            bucket_minute = (int(ts[14:16]) // 15) * 15
-            # scanned_at is UTC; keep the Z so the dashboard parses it as UTC
-            # instead of browser-local time.
-            bucket_key = f"{ts[:14]}{bucket_minute:02d}:00Z"
+            # Hourly buckets. scanned_at is UTC; keep the Z so the dashboard
+            # parses it as UTC instead of browser-local time.
+            bucket_key = f"{ts[:13]}:00:00Z"
             arrivals_buckets[bucket_key] += 1
             if ts[:19] >= pace_threshold:
                 pace_15min += 1
@@ -677,8 +677,12 @@ def checkin_stats(_=Depends(require_admin)):
                 "at": r.get("scanned_at"),
                 "raw_payload": r.get("raw_payload"),
             })
+            # Malformed-QR let-ins carry no ep_id, so the gate-unique sets
+            # can't count them; each override is treated as one person.
+            if ep_id is None and cp and cp.get("mode") == "gate":
+                unlisted_noid += 1
 
-    unique_inside = len(gate_unique_eps) + walkin_unpromoted
+    unique_inside = len(gate_unique_eps) + walkin_unpromoted + unlisted_noid
 
     # Admission mix: gate uniques split into roster members vs unknown-ticket
     # let-ins (qr_unlisted with an ep_id not in this event, e.g. old-event QRs).
@@ -706,16 +710,24 @@ def checkin_stats(_=Depends(require_admin)):
         for cpid in per_checkpoint_scans
     ]
 
-    per_volunteer = [
-        {
-            "volunteer_id": vid,
-            "display_name": volunteers.get(vid, {}).get("display_name"),
-            "checkpoint_label": checkpoints.get(volunteers.get(vid, {}).get("checkpoint_id"), {}).get("label"),
-            "scans": per_volunteer_scans[vid],
-            "last_sync": per_volunteer_last_sync.get(vid),
-        }
-        for vid in per_volunteer_scans
-    ]
+    # All active volunteers, not just those with scans — the heartbeat
+    # (volunteers.last_seen_at) tells "device offline" apart from "no new
+    # scans"; max(received_at) is the fallback for app builds without it.
+    per_volunteer = sorted(
+        [
+            {
+                "volunteer_id": vid,
+                "display_name": v.get("display_name"),
+                "checkpoint_label": checkpoints.get(v.get("checkpoint_id"), {}).get("label"),
+                "scans": per_volunteer_scans.get(vid, 0),
+                "last_sync": v.get("last_seen_at") or per_volunteer_last_sync.get(vid),
+            }
+            for vid, v in volunteers.items()
+            if v.get("active", True)
+        ],
+        key=lambda x: x["scans"],
+        reverse=True,
+    )
 
     arrivals_curve = [
         {"t": t, "count": c} for t, c in sorted(arrivals_buckets.items())
@@ -731,7 +743,7 @@ def checkin_stats(_=Depends(require_admin)):
         "walkin_count": walkin_count,
         "search_count": search_count,
         "registered_inside": len(registered_inside),
-        "unlisted_inside": len(unlisted_inside),
+        "unlisted_inside": len(unlisted_inside) + unlisted_noid,
         "pace_15min": pace_15min,
         "attendance_rate": (unique_inside / total_registered) if total_registered else 0,
         "per_checkpoint": per_checkpoint,
