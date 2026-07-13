@@ -7,7 +7,7 @@ import qrcode
 from PIL import Image, ImageDraw
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
-import io, os, re, uuid, smtplib, ssl
+import io, os, re, uuid, smtplib, ssl, base64, time
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -325,6 +325,169 @@ def card_track(payload: TrackPayload = None):
     session_id = (payload.session_id if payload else None) or None
     supabase.table("card_downloads").insert({"type": event_type, "session_id": session_id}).execute()
     return {"status": "ok"}
+
+# ── Ticket self-service (public) ──────────────────────────────
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Best-effort in-memory rate limit. Vercel serverless = per-instance only,
+# but it's enough to stop casual phone→name enumeration from one client.
+_rate_hits: dict = {}
+RATE_LIMIT  = 15     # requests
+RATE_WINDOW = 60     # seconds
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def check_rate_limit(request: Request):
+    ip  = _client_ip(request)
+    now = time.time()
+    hits = [t for t in _rate_hits.get(ip, []) if now - t < RATE_WINDOW]
+    if len(hits) >= RATE_LIMIT:
+        raise HTTPException(429, "Too many attempts — wait a minute and try again")
+    hits.append(now)
+    _rate_hits[ip] = hits
+
+def _full_name(p: dict) -> str:
+    return f"{p.get('first_name') or ''} {p.get('last_name') or ''}".strip()
+
+def _qr_b64(ep_id: str, p: dict) -> str:
+    qr = generate_qr_bytes(ep_id, p.get("first_name") or "", p.get("last_name") or "",
+                           p.get("email") or "", p.get("phone"))
+    return base64.b64encode(qr).decode()
+
+def _eps_for_participants(participant_ids: list) -> list:
+    """event_participants rows for this event, newest first."""
+    return (supabase.table("event_participants")
+        .select("id, participant_id, registered_at")
+        .eq("event_id", EVENT_ID)
+        .in_("participant_id", participant_ids)
+        .order("registered_at", desc=True)
+        .execute().data)
+
+
+class TicketLookup(BaseModel):
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+
+@app.post("/api/ticket/lookup")
+def ticket_lookup(body: TicketLookup, request: Request):
+    """Public. Email hit → returns the QR directly. Phone hit → returns up
+    to 2 name candidates (never the QR — that comes from /claim after the
+    person confirms their name and their email)."""
+    check_rate_limit(request)
+    if not EVENT_ID:
+        raise HTTPException(500, "EVENT_ID not configured")
+
+    # ── Email path ──
+    if body.email and body.email.strip():
+        email = clean_email(body.email)
+        parts = (supabase.table("participants")
+            .select("id, first_name, last_name, email, phone")
+            .eq("email", email).execute().data)
+        if parts:
+            eps = _eps_for_participants([p["id"] for p in parts])
+            if eps:
+                ep  = eps[0]
+                p   = next(x for x in parts if x["id"] == ep["participant_id"])
+                return {"status": "found", "name": _full_name(p), "qr": _qr_b64(ep["id"], p)}
+        return {"status": "not_found"}
+
+    # ── Phone path ──
+    if body.phone and body.phone.strip():
+        phone = clean_phone(body.phone)
+        if not phone:
+            return {"status": "not_found"}
+        parts = (supabase.table("participants")
+            .select("id, first_name, last_name, email, phone")
+            .eq("phone", phone).execute().data)
+        if not parts:
+            return {"status": "not_found"}
+        eps = _eps_for_participants([p["id"] for p in parts])
+        if not eps:
+            return {"status": "not_found"}
+        pmap = {p["id"]: p for p in parts}
+        candidates = [
+            {"ep_id": ep["id"], "name": _full_name(pmap.get(ep["participant_id"], {}))}
+            for ep in eps[:2]
+        ]
+        return {"status": "candidates", "candidates": candidates}
+
+    raise HTTPException(422, "Provide email or phone")
+
+
+class TicketClaim(BaseModel):
+    ep_id: str
+    phone: str
+    email: str
+
+
+@app.post("/api/ticket/claim")
+def ticket_claim(body: TicketClaim, request: Request):
+    """Public. Reached from the phone path after name confirmation. The
+    phone must match the stored one (a leaked ep_id alone gets nothing).
+    Corrects the email if changed, re-sends the ticket, returns the QR."""
+    check_rate_limit(request)
+    if not EVENT_ID:
+        raise HTTPException(500, "EVENT_ID not configured")
+
+    ep_rows = (supabase.table("event_participants")
+        .select("id, participant_id, event_id")
+        .eq("id", body.ep_id).limit(1).execute().data)
+    if not ep_rows or ep_rows[0].get("event_id") != EVENT_ID:
+        raise HTTPException(404, "Registration not found")
+    pid = ep_rows[0]["participant_id"]
+
+    p_rows = (supabase.table("participants")
+        .select("id, first_name, last_name, email, phone")
+        .eq("id", pid).limit(1).execute().data)
+    if not p_rows:
+        raise HTTPException(404, "Participant not found")
+    d = p_rows[0]
+
+    # Verify the phone — proves this claim came from a real phone lookup.
+    phone = clean_phone(body.phone)
+    if not phone or phone != d.get("phone"):
+        raise HTTPException(403, "Phone does not match this registration")
+
+    new_email = clean_email(body.email)
+    if not EMAIL_RE.match(new_email):
+        raise HTTPException(422, "Invalid email")
+
+    first = d.get("first_name") or ""
+
+    # Correct the email if it changed, keeping an audit trail.
+    if new_email != (d.get("email") or ""):
+        try:
+            supabase.table("email_changes").insert({
+                "participant_id": pid,
+                "old_email": d.get("email"),
+                "new_email": new_email,
+            }).execute()
+        except Exception as e:
+            print(f"email_changes log failed: {e}")   # never blocks the claim
+        supabase.table("participants").update({"email": new_email}).eq("id", pid).execute()
+        d["email"] = new_email
+
+    qr_bytes   = generate_qr_bytes(body.ep_id, first, d.get("last_name") or "", new_email, phone)
+    email_sent = False
+    try:
+        send_email(new_email, first, qr_bytes)
+        mark_qr_sent(body.ep_id)
+        email_sent = True
+    except Exception as e:
+        print(f"ticket claim email failed for {new_email}: {e}")   # QR still returned
+
+    return {
+        "status": "ok",
+        "name": _full_name(d),
+        "qr": base64.b64encode(qr_bytes).decode(),
+        "email_sent": email_sent,
+    }
 
 # ── Admin auth ────────────────────────────────────────────────
 
