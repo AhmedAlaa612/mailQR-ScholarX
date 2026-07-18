@@ -658,12 +658,14 @@ class VolunteerCreate(BaseModel):
     email: str
     password: str
     display_name: str
+    phone: Optional[str] = None
     checkpoint_id: Optional[str] = None
     role: str = "scanner"
 
 
 class VolunteerUpdate(BaseModel):  # PATCH semantics: only provided fields change
     display_name: Optional[str] = None
+    phone: Optional[str] = None
     checkpoint_id: Optional[str] = None
     role: Optional[str] = None
     active: Optional[bool] = None
@@ -702,6 +704,11 @@ def list_volunteers(_=Depends(require_admin)):
 
 @app.post("/api/admin/volunteers")
 def create_volunteer(body: VolunteerCreate, _=Depends(require_admin)):
+    phone = None
+    if body.phone and body.phone.strip():
+        phone = clean_phone(body.phone)
+        if not phone:
+            raise HTTPException(422, "Invalid phone number")
     try:
         u = supabase.auth.admin.create_user({
             "email": body.email, "password": body.password, "email_confirm": True})
@@ -710,7 +717,7 @@ def create_volunteer(body: VolunteerCreate, _=Depends(require_admin)):
     try:
         supabase.table("volunteers").insert({
             "id": u.user.id, "email": body.email, "display_name": body.display_name,
-            "checkpoint_id": body.checkpoint_id, "role": body.role}).execute()
+            "phone": phone, "checkpoint_id": body.checkpoint_id, "role": body.role}).execute()
     except PostgrestAPIError as e:
         raise HTTPException(422, getattr(e, "message", str(e)))
     return {"id": u.user.id}
@@ -718,9 +725,17 @@ def create_volunteer(body: VolunteerCreate, _=Depends(require_admin)):
 
 @app.patch("/api/admin/volunteers/{vid}")
 def update_volunteer(vid: str, body: VolunteerUpdate, _=Depends(require_admin)):
+    # exclude_unset (not exclude_none): a PATCH must be able to explicitly
+    # clear checkpoint_id (unassign a gate) by sending null — exclude_none
+    # silently dropped that key and the update became a no-op.
+    updates = body.dict(exclude_unset=True)
+    if "phone" in updates and updates["phone"] and updates["phone"].strip():
+        phone = clean_phone(updates["phone"])
+        if not phone:
+            raise HTTPException(422, "Invalid phone number")
+        updates["phone"] = phone
     try:
-        supabase.table("volunteers").update(
-            body.dict(exclude_none=True)).eq("id", vid).execute()
+        supabase.table("volunteers").update(updates).eq("id", vid).execute()
     except PostgrestAPIError as e:
         raise HTTPException(422, getattr(e, "message", str(e)))
     return {"status": "ok"}
@@ -881,6 +896,7 @@ def checkin_stats(_=Depends(require_admin)):
             {
                 "volunteer_id": vid,
                 "display_name": v.get("display_name"),
+                "phone": v.get("phone"),
                 "checkpoint_label": checkpoints.get(v.get("checkpoint_id"), {}).get("label"),
                 "scans": per_volunteer_scans.get(vid, 0),
                 "last_sync": v.get("last_seen_at") or per_volunteer_last_sync.get(vid),
