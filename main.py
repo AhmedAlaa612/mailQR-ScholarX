@@ -675,6 +675,21 @@ class PasswordBody(BaseModel):
     password: str
 
 
+class SessionCreate(BaseModel):
+    checkpoint_id: str
+    label: str
+    capacity: Optional[int] = None
+    carryover: Optional[int] = None  # people who stayed from the previous session
+
+
+class SessionUpdate(BaseModel):  # PATCH semantics: only provided fields change
+    label: Optional[str] = None
+    capacity: Optional[int] = None
+    carryover: Optional[int] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None  # explicit null re-opens the session
+
+
 @app.get("/api/admin/checkpoints")
 def list_checkpoints(_=Depends(require_admin)):
     return supabase.table("checkpoints").select("*").order("label").execute().data
@@ -691,6 +706,138 @@ def create_checkpoint(body: CheckpointCreate, _=Depends(require_admin)):
         raise HTTPException(422, getattr(e, "message", str(e)))
     return res.data[0]
 # NOTE: no update/delete endpoints for checkpoints. Intentional. Do not add them.
+
+
+# ── Room sessions ─────────────────────────────────────────────
+# A session is a time window over the immutable checkins log. Attribution and
+# occupancy are computed by bucketing scans into windows, so editing a window
+# (admin forgot to tap start/end) recomputes every count correctly.
+
+def _parse_ts(s: Optional[str]) -> Optional[datetime]:
+    """Timestamps arrive as both '...Z' (phone clocks) and '...+00:00'
+    (Postgres) — normalize before comparing, never compare strings."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+@app.get("/api/admin/sessions")
+def list_sessions(_=Depends(require_admin)):
+    sessions = (supabase.table("sessions").select("*")
+                .order("started_at", desc=True).execute().data)
+    checkpoints = {c["id"]: c for c in
+                   supabase.table("checkpoints").select("*").execute().data}
+    rows = (
+        supabase.table("checkins")
+        .select("event_participant_id, checkpoint_id, scanned_at, kind")
+        .eq("event_id", EVENT_ID)
+        .limit(20000)
+        .execute()
+        .data
+    )
+
+    now = datetime.now(timezone.utc)
+    out = []
+    for s in sessions:
+        start = _parse_ts(s.get("started_at"))
+        end = _parse_ts(s.get("ended_at")) or now
+        unique_eps = set()
+        noid = 0   # ep-less admits (unlisted let-ins, walk-ins): +1 person each
+        scans = 0
+        if start:
+            for r in rows:
+                if r.get("checkpoint_id") != s["checkpoint_id"]:
+                    continue
+                ts = _parse_ts(r.get("scanned_at"))
+                if ts is None or ts < start or ts > end:
+                    continue
+                scans += 1
+                ep = r.get("event_participant_id")
+                if ep is not None:
+                    unique_eps.add(ep)
+                elif r.get("kind") in ("qr_unlisted", "walkin"):
+                    noid += 1
+        cp = checkpoints.get(s["checkpoint_id"], {})
+        unique_count = len(unique_eps) + noid
+        carryover = s.get("carryover") or 0
+        out.append({
+            **s,
+            "checkpoint_label": cp.get("label"),
+            "checkpoint_mode": cp.get("mode"),
+            "unique_count": unique_count,       # scanned in during this window
+            "carryover": carryover,             # admin estimate: stayed from last session
+            "occupancy": carryover + unique_count,
+            "scans": scans,
+            "open": s.get("ended_at") is None,
+        })
+    return out
+
+
+@app.post("/api/admin/sessions")
+def create_session(body: SessionCreate, _=Depends(require_admin)):
+    cps = (supabase.table("checkpoints").select("*")
+           .eq("id", body.checkpoint_id).limit(1).execute().data)
+    if not cps:
+        raise HTTPException(422, "Unknown checkpoint")
+    if cps[0].get("mode") != "room":
+        raise HTTPException(422, "Sessions can only run at room checkpoints")
+    if not body.label.strip():
+        raise HTTPException(422, "Label is required")
+    if body.capacity is not None and body.capacity <= 0:
+        raise HTTPException(422, "Capacity must be a positive number")
+    if body.carryover is not None and body.carryover < 0:
+        raise HTTPException(422, "Carryover cannot be negative")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Starting a new session auto-ends any open one at this room — the partial
+    # unique index forbids two open sessions, and on event day one tap beats two.
+    supabase.table("sessions").update({"ended_at": now_iso}) \
+        .eq("checkpoint_id", body.checkpoint_id).is_("ended_at", "null").execute()
+    try:
+        res = supabase.table("sessions").insert({
+            "checkpoint_id": body.checkpoint_id,
+            "label": body.label.strip(),
+            "capacity": body.capacity,
+            "carryover": body.carryover or 0,
+            "started_at": now_iso,
+        }).execute()
+    except PostgrestAPIError as e:
+        raise HTTPException(422, getattr(e, "message", str(e)))
+    return res.data[0]
+
+
+@app.post("/api/admin/sessions/{sid}/end")
+def end_session(sid: str, _=Depends(require_admin)):
+    res = (supabase.table("sessions")
+           .update({"ended_at": datetime.now(timezone.utc).isoformat()})
+           .eq("id", sid).is_("ended_at", "null").execute())
+    if not res.data:
+        raise HTTPException(404, "Session not found or already ended")
+    return res.data[0]
+
+
+@app.patch("/api/admin/sessions/{sid}")
+def update_session(sid: str, body: SessionUpdate, _=Depends(require_admin)):
+    # Recovery hatch: fix a forgotten start/end after the fact and every count
+    # recomputes from the scan log. exclude_unset so ended_at=null can re-open.
+    updates = body.dict(exclude_unset=True)
+    if not updates:
+        return {"status": "ok"}
+    for k in ("started_at", "ended_at"):
+        if k in updates and updates[k] is not None and _parse_ts(updates[k]) is None:
+            raise HTTPException(422, f"{k} must be an ISO timestamp")
+    if "capacity" in updates and updates["capacity"] is not None and updates["capacity"] <= 0:
+        raise HTTPException(422, "Capacity must be a positive number")
+    if "carryover" in updates and (updates["carryover"] is None or updates["carryover"] < 0):
+        raise HTTPException(422, "Carryover must be zero or more")
+    try:
+        supabase.table("sessions").update(updates).eq("id", sid).execute()
+    except PostgrestAPIError as e:
+        raise HTTPException(422, getattr(e, "message", str(e)))
+    return {"status": "ok"}
 
 
 @app.get("/api/admin/volunteers")
