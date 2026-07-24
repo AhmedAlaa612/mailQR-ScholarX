@@ -5,3 +5,7 @@ qrcode[pil]
 Pillow
 python-multipart
 python-dotenv
+pypdf
+reportlab
+arabic-reshaper
+python-bidi

@@ -45,6 +45,9 @@ env/
 # QR Codes
 qr_codes/
 
+# Certificate test output
+cert_test_output/
+
 # Logs
 *.log
 

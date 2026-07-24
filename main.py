@@ -12,8 +12,15 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
+from email.mime.application import MIMEApplication
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas as pdf_canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import arabic_reshaper
+from bidi.algorithm import get_display
 
 load_dotenv()
 
@@ -49,6 +56,18 @@ SMTP_TIMEOUT = float(env_str("SMTP_TIMEOUT", "20") or "20")
 SMTP_SECURE  = env_bool("SMTP_SECURE", SMTP_PORT == 465)
 EVENT_ID     = env_str("EVENT_ID")   # V1 event uuid from Supabase
 ADMIN_KEY    = env_str("ADMIN_KEY")
+
+# ── Certificates ──────────────────────────────────────────────
+CERT_SECRET       = env_str("CERT_SECRET")               # shared secret with the Apps Script
+CERT_TEMPLATE_PATH = env_str("CERT_TEMPLATE_PATH", "certificate_template.pdf")
+CERT_FONT_PATH     = env_str("CERT_FONT_PATH", "NotoSansArabic-Regular.ttf")
+CERT_FONT_NAME     = "NotoSansArabic"
+CERT_NAME_X        = env_str("CERT_NAME_X")              # None = horizontally centered
+CERT_NAME_Y        = float(env_str("CERT_NAME_Y", "340") or "340")
+CERT_FONT_SIZE     = float(env_str("CERT_FONT_SIZE", "30") or "30")
+
+if os.path.exists(CERT_FONT_PATH):
+    pdfmetrics.registerFont(TTFont(CERT_FONT_NAME, CERT_FONT_PATH))
 
 app = FastAPI(title="ScholarX Registration API")
 
@@ -226,6 +245,23 @@ def generate_qr_bytes(ep_id: str, first_name: str, last_name: str,
 
 # ── Email ─────────────────────────────────────────────────────
 
+def smtp_send_message(msg: MIMEMultipart, to_email: str):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("Missing SMTP config")
+
+    if SMTP_SECURE:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, to_email, msg.as_string())
+        return
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, to_email, msg.as_string())
+
 def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     body = (
         f"Hey {first_name}, thanks for registering for the Next Scholar Summit!\n\n"
@@ -246,21 +282,99 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes):
     img_part.add_header("Content-Disposition", "attachment", filename="ticket.png")
     msg.attach(img_part)
 
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError("Missing SMTP config")
+    smtp_send_message(msg, to_email)
 
-    if SMTP_SECURE:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, to_email, msg.as_string())
-        return
+def send_certificate_email(to_email: str, first_name: str, cert_bytes: bytes):
+    body = (
+        f"Dear {first_name},\n\n"
+        "Thank you for attending the Next Scholar Summit, organized by ScholarX as part of "
+        "our mission to empower youth and expand access to scholarship opportunities.\n\n"
+        "Please find your Certificate of Attendance attached to this email.\n\n"
+        "We wish you continued success in your academic and professional journey.\n\n"
+        "Warm regards,\n"
+        "The ScholarX Team"
+    )
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
-        server.ehlo()
-        server.starttls(context=ssl.create_default_context())
-        server.ehlo()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, to_email, msg.as_string())
+    msg = MIMEMultipart()
+    msg["From"]    = SMTP_FROM or f"{FROM_NAME} <{SMTP_USER}>"
+    msg["To"]      = to_email
+    msg["Subject"] = "Your Certificate — Next Scholar Summit"
+    msg.attach(MIMEText(body, "plain"))
+
+    pdf_part = MIMEApplication(cert_bytes, _subtype="pdf")
+    pdf_part.add_header("Content-Disposition", "attachment", filename="certificate.pdf")
+    msg.attach(pdf_part)
+
+    smtp_send_message(msg, to_email)
+
+# ── Certificate Generator ────────────────────────────────────
+
+def is_arabic(text: str) -> bool:
+    return bool(re.search(r'[؀-ۿ]', text))
+
+def _cert_overlay(name: str, page_width: float, page_height: float) -> PdfReader:
+    if is_arabic(name):
+        name = get_display(arabic_reshaper.reshape(name))
+
+    x = page_width / 2 if not CERT_NAME_X else float(CERT_NAME_X)
+
+    packet = io.BytesIO()
+    c = pdf_canvas.Canvas(packet, pagesize=(page_width, page_height))
+    c.setFont(CERT_FONT_NAME, CERT_FONT_SIZE)
+    c.drawCentredString(x, CERT_NAME_Y, name)
+    c.save()
+    packet.seek(0)
+    return PdfReader(packet)
+
+def generate_certificate_bytes(name: str) -> bytes:
+    """Overlay `name` onto the certificate template and return PDF bytes."""
+    template = PdfReader(CERT_TEMPLATE_PATH)
+    page = template.pages[0]
+
+    overlay = _cert_overlay(name, page.mediabox.width, page.mediabox.height)
+    page.merge_page(overlay.pages[0])
+
+    writer = PdfWriter()
+    writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.getvalue()
+
+def mark_cert_sent(ep_id: str):
+    supabase.table("event_participants").update({"cert_sent": True}).eq("id", ep_id).execute()
+
+def has_attended(ep_id: str) -> bool:
+    rows = (supabase.table("checkins")
+        .select("id")
+        .eq("event_id", EVENT_ID)
+        .eq("event_participant_id", ep_id)
+        .limit(1)
+        .execute().data)
+    return bool(rows)
+
+def log_certificate_request(email: str):
+    """Records that the certificate form was submitted for this email —
+    powers the admin 'form responses' view. Best-effort: never blocks the
+    actual send if the table is missing or the insert fails."""
+    try:
+        supabase.table("certificate_requests").upsert(
+            {"email": email, "last_seen_at": datetime.now(timezone.utc).isoformat()},
+            on_conflict="email",
+        ).execute()
+    except Exception as e:
+        print(f"certificate_requests log failed for {email}: {e}")
+
+def send_certificate_now(ep_id: str, email: str, first_name: str, full_name: str):
+    """Generate + email the certificate and mark it sent. Raises on failure."""
+    cert_bytes = generate_certificate_bytes(full_name)
+    send_certificate_email(email, first_name or full_name, cert_bytes)
+    mark_cert_sent(ep_id)
+
+def require_cert_secret(x_cert_secret: Optional[str] = Header(None)):
+    if not CERT_SECRET or x_cert_secret != CERT_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ── Endpoints ─────────────────────────────────────────────────
 
@@ -489,6 +603,54 @@ def ticket_claim(body: TicketClaim, request: Request):
         "email_sent": email_sent,
     }
 
+# ── Certificate self-service (called from the Apps Script) ─────
+
+class CertificateSend(BaseModel):
+    email: str
+
+
+@app.post("/api/certificate/send")
+def certificate_send(body: CertificateSend, _=Depends(require_cert_secret)):
+    """Called by the certificate Google Form's Apps Script on every submit.
+    Sends the certificate only if the email is a registered participant of
+    this event AND has at least one checkin recorded (i.e. actually attended).
+    Idempotent — repeat submissions from the same email won't re-send."""
+    if not EVENT_ID:
+        raise HTTPException(500, "EVENT_ID not configured")
+
+    email = clean_email(body.email)
+    log_certificate_request(email)
+
+    parts = (supabase.table("participants")
+        .select("id, first_name, last_name, email")
+        .eq("email", email).limit(1).execute().data)
+    if not parts:
+        return {"status": "not_registered"}
+    p = parts[0]
+
+    ep_rows = (supabase.table("event_participants")
+        .select("id, cert_sent")
+        .eq("event_id", EVENT_ID)
+        .eq("participant_id", p["id"])
+        .limit(1).execute().data)
+    if not ep_rows:
+        return {"status": "not_registered"}
+    ep = ep_rows[0]
+
+    if not has_attended(ep["id"]):
+        return {"status": "not_attended"}
+
+    if ep.get("cert_sent"):
+        return {"status": "already_sent"}
+
+    full_name = _full_name(p)
+    try:
+        send_certificate_now(ep["id"], email, p.get("first_name"), full_name)
+    except Exception as e:
+        raise HTTPException(500, f"certificate send failed: {e}")
+
+    return {"status": "sent", "name": full_name}
+
 # ── Admin auth ────────────────────────────────────────────────
 
 def require_admin(x_admin_key: Optional[str] = Header(None)):
@@ -642,6 +804,145 @@ def admin_qr(ep_id: str, _=Depends(require_admin)):
     )
 
 
+@app.get("/api/admin/certificate-preview")
+def admin_certificate_preview(name: str = "Preview Name", _=Depends(require_admin)):
+    """Render the certificate template with a given name, without sending
+    anything. Use this to tune CERT_NAME_X/CERT_NAME_Y/CERT_FONT_SIZE against
+    the real Canva export before wiring up the form."""
+    if not os.path.exists(CERT_TEMPLATE_PATH):
+        raise HTTPException(500, f"Template not found at {CERT_TEMPLATE_PATH}")
+    cert_bytes = generate_certificate_bytes(name)
+    return Response(
+        content=cert_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'inline; filename="certificate-preview.pdf"'},
+    )
+
+
+@app.get("/api/admin/certificate-stats")
+def admin_certificate_stats(_=Depends(require_admin)):
+    """Form-response view: everyone who has submitted the certificate Google
+    Form, whether they turned out to have attended, and whether they've
+    been sent a certificate."""
+    if not EVENT_ID:
+        raise HTTPException(500, "EVENT_ID not configured")
+
+    try:
+        requests_rows = (supabase.table("certificate_requests")
+            .select("email, first_seen_at")
+            .order("first_seen_at", desc=True)
+            .limit(10000).execute().data)
+    except PostgrestAPIError as e:
+        raise HTTPException(500, f"certificate_requests table query failed (did you run "
+                                 f"the migration?): {getattr(e, 'message', str(e))}")
+
+    emails = [r["email"] for r in requests_rows]
+    participants = (supabase.table("participants")
+        .select("id, first_name, last_name, email, phone")
+        .in_("email", emails).execute().data) if emails else []
+    email_to_p = {p["email"]: p for p in participants}
+
+    pids = [p["id"] for p in participants]
+    eps = (supabase.table("event_participants")
+        .select("id, participant_id, cert_sent")
+        .eq("event_id", EVENT_ID)
+        .in_("participant_id", pids).execute().data) if pids else []
+    pid_to_ep = {e["participant_id"]: e for e in eps}
+
+    ep_ids = [e["id"] for e in eps]
+    checkins = (supabase.table("checkins")
+        .select("event_participant_id")
+        .eq("event_id", EVENT_ID)
+        .in_("event_participant_id", ep_ids).execute().data) if ep_ids else []
+    attended_ep_ids = {c["event_participant_id"] for c in checkins if c.get("event_participant_id")}
+
+    responses = []
+    for r in requests_rows:
+        p = email_to_p.get(r["email"])
+        ep = pid_to_ep.get(p["id"]) if p else None
+        attended = bool(ep and ep["id"] in attended_ep_ids)
+        responses.append({
+            "email": r["email"],
+            "name": _full_name(p) if p else None,
+            "registered": bool(p),
+            "attended": attended,
+            "cert_sent": bool(ep and ep.get("cert_sent")),
+            "requested_at": r.get("first_seen_at"),
+        })
+
+    return {
+        "total_responses": len(responses),
+        "attended": sum(1 for r in responses if r["attended"]),
+        "cert_sent": sum(1 for r in responses if r["cert_sent"]),
+        "responses": responses,
+    }
+
+
+@app.get("/api/admin/attendees")
+def admin_attendees(_=Depends(require_admin)):
+    """Everyone recorded as having attended the event (>=1 checkin), with
+    certificate status — independent of whether they filled the form."""
+    if not EVENT_ID:
+        raise HTTPException(500, "EVENT_ID not configured")
+
+    eps = (supabase.table("event_participants")
+        .select("id, cert_sent, participants(id, first_name, last_name, email, phone)")
+        .eq("event_id", EVENT_ID)
+        .limit(10000).execute().data)
+
+    checkins = (supabase.table("checkins")
+        .select("event_participant_id")
+        .eq("event_id", EVENT_ID)
+        .limit(20000).execute().data)
+    attended_ep_ids = {c["event_participant_id"] for c in checkins if c.get("event_participant_id")}
+
+    attendees = []
+    for ep in eps:
+        if ep["id"] not in attended_ep_ids:
+            continue
+        p = ep.get("participants") or {}
+        attendees.append({
+            "ep_id": ep["id"],
+            "name": _full_name(p),
+            "email": p.get("email"),
+            "phone": p.get("phone"),
+            "cert_sent": bool(ep.get("cert_sent")),
+        })
+    attendees.sort(key=lambda a: a["name"] or "")
+
+    return {"data": attendees, "count": len(attendees)}
+
+
+@app.post("/api/admin/certificate/send/{ep_id}")
+def admin_certificate_send(ep_id: str, _=Depends(require_admin)):
+    """Manual send/resend for one attendee, triggered from the admin table."""
+    ep_rows = (supabase.table("event_participants")
+        .select("id, participant_id, event_id")
+        .eq("id", ep_id).limit(1).execute().data)
+    if not ep_rows or ep_rows[0].get("event_id") != EVENT_ID:
+        raise HTTPException(404, "Registration not found")
+
+    p_rows = (supabase.table("participants")
+        .select("first_name, last_name, email")
+        .eq("id", ep_rows[0]["participant_id"]).limit(1).execute().data)
+    if not p_rows:
+        raise HTTPException(404, "Participant not found")
+    d = p_rows[0]
+
+    if not has_attended(ep_id):
+        raise HTTPException(422, "This person has no recorded check-in")
+    if not d.get("email"):
+        raise HTTPException(422, "This participant has no email on file")
+
+    full_name = _full_name(d)
+    try:
+        send_certificate_now(ep_id, d["email"], d.get("first_name"), full_name)
+    except Exception as e:
+        raise HTTPException(500, f"certificate send failed: {e}")
+
+    return {"status": "sent", "name": full_name}
+
+
 # ── Check-in app additions (developer-plan.md) ───────────────────
 
 from collections import defaultdict
@@ -726,8 +1027,15 @@ def _parse_ts(s: Optional[str]) -> Optional[datetime]:
 
 @app.get("/api/admin/sessions")
 def list_sessions(_=Depends(require_admin)):
-    sessions = (supabase.table("sessions").select("*")
-                .order("started_at", desc=True).execute().data)
+    try:
+        sessions = (supabase.table("sessions").select("*")
+                    .order("started_at", desc=True).execute().data)
+    except PostgrestAPIError as e:
+        # Raise through HTTPException so the response carries CORS headers and a
+        # readable cause — an unhandled 500 reaches the browser as a bare CORS
+        # error. Most likely cause: migration-sessions.sql not run yet.
+        raise HTTPException(500, f"sessions table query failed (did you run "
+                                 f"migration-sessions.sql?): {getattr(e, 'message', str(e))}")
     checkpoints = {c["id"]: c for c in
                    supabase.table("checkpoints").select("*").execute().data}
     rows = (
