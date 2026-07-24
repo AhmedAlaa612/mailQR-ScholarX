@@ -864,6 +864,7 @@ def admin_certificate_stats(_=Depends(require_admin)):
         responses.append({
             "email": r["email"],
             "name": _full_name(p) if p else None,
+            "ep_id": ep["id"] if ep else None,
             "registered": bool(p),
             "attended": attended,
             "cert_sent": bool(ep and ep.get("cert_sent")),
