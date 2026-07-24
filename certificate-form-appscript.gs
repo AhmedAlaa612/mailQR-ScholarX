@@ -20,6 +20,13 @@
 var EMAIL_QUESTION_TITLE = "Email"; // must match your form's email question title exactly
 
 function onFormSubmit(e) {
+  if (!e || (!e.response && !e.namedValues)) {
+    // No usable event object — this is a manual "Run" from the editor, not a
+    // real submission (Apps Script passes {} for those). Nothing to do.
+    console.log("onFormSubmit called without a form-submit event — skipping (manual test run?).");
+    return;
+  }
+
   var props = PropertiesService.getScriptProperties();
   var backendUrl = props.getProperty("BACKEND_URL");
   var certSecret = props.getProperty("CERT_SECRET");
@@ -62,13 +69,26 @@ function onFormSubmit(e) {
 }
 
 function extractEmail(e) {
-  var items = e.response.getItemResponses();
-  for (var i = 0; i < items.length; i++) {
-    var title = items[i].getItem().getTitle();
-    if (title === EMAIL_QUESTION_TITLE) {
-      return items[i].getResponse();
+  // Form-bound trigger (script created via the Form's own Extensions > Apps
+  // Script) — this is the expected setup.
+  if (e.response) {
+    var items = e.response.getItemResponses();
+    for (var i = 0; i < items.length; i++) {
+      var title = items[i].getItem().getTitle();
+      if (title === EMAIL_QUESTION_TITLE) {
+        return items[i].getResponse();
+      }
     }
+    return null;
   }
+
+  // Sheet-bound trigger (script created via the linked response
+  // spreadsheet's Extensions > Apps Script instead) — different event shape.
+  if (e.namedValues) {
+    var values = e.namedValues[EMAIL_QUESTION_TITLE];
+    return values && values[0] ? values[0] : null;
+  }
+
   return null;
 }
 

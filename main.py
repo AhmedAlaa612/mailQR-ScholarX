@@ -292,7 +292,7 @@ def send_certificate_email(to_email: str, first_name: str, cert_bytes: bytes):
         "Please find your Certificate of Attendance attached to this email.\n\n"
         "We wish you continued success in your academic and professional journey.\n\n"
         "Warm regards,\n"
-        "The ScholarX Team"
+        "ScholarX Team"
     )
 
     msg = MIMEMultipart()
