@@ -916,7 +916,9 @@ def admin_attendees(_=Depends(require_admin)):
 
 @app.post("/api/admin/certificate/send/{ep_id}")
 def admin_certificate_send(ep_id: str, _=Depends(require_admin)):
-    """Manual send/resend for one attendee, triggered from the admin table."""
+    """Manual send/resend, triggered from the admin table. This is an
+    explicit admin override — unlike the public /api/certificate/send used
+    by the form, it does NOT require a recorded check-in."""
     ep_rows = (supabase.table("event_participants")
         .select("id, participant_id, event_id")
         .eq("id", ep_id).limit(1).execute().data)
@@ -930,8 +932,6 @@ def admin_certificate_send(ep_id: str, _=Depends(require_admin)):
         raise HTTPException(404, "Participant not found")
     d = p_rows[0]
 
-    if not has_attended(ep_id):
-        raise HTTPException(422, "This person has no recorded check-in")
     if not d.get("email"):
         raise HTTPException(422, "This participant has no email on file")
 
