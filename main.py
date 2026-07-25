@@ -7,7 +7,7 @@ import qrcode
 from PIL import Image, ImageDraw
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
-import io, os, re, uuid, smtplib, ssl, base64, time
+import io, os, re, uuid, smtplib, ssl, base64, time, itertools
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -468,6 +468,21 @@ def check_rate_limit(request: Request):
 def _full_name(p: dict) -> str:
     return f"{p.get('first_name') or ''} {p.get('last_name') or ''}".strip()
 
+def _batch_in_filter(table, column: str, values: list, select: str = "*",
+                     eq: Optional[tuple] = None, batch_size: int = 100) -> list:
+    """Run a select with .in_(column, chunk) in batches to avoid URL length limits."""
+    if not values:
+        return []
+    it = iter(values)
+    results = []
+    while chunk := list(itertools.islice(it, batch_size)):
+        q = table.select(select).in_(column, chunk)
+        if eq:
+            q = q.eq(eq[0], eq[1])
+        results.extend(q.execute().data)
+    return results
+
+
 def _qr_b64(ep_id: str, p: dict) -> str:
     qr = generate_qr_bytes(ep_id, p.get("first_name") or "", p.get("last_name") or "",
                            p.get("email") or "", p.get("phone"))
@@ -475,12 +490,14 @@ def _qr_b64(ep_id: str, p: dict) -> str:
 
 def _eps_for_participants(participant_ids: list) -> list:
     """event_participants rows for this event, newest first."""
-    return (supabase.table("event_participants")
-        .select("id, participant_id, registered_at")
-        .eq("event_id", EVENT_ID)
-        .in_("participant_id", participant_ids)
-        .order("registered_at", desc=True)
-        .execute().data)
+    rows = _batch_in_filter(
+        supabase.table("event_participants"),
+        "participant_id", participant_ids,
+        select="id, participant_id, registered_at",
+        eq=("event_id", EVENT_ID),
+    )
+    rows.sort(key=lambda r: r.get("registered_at") or "", reverse=True)
+    return rows
 
 
 class TicketLookup(BaseModel):
@@ -837,23 +854,29 @@ def admin_certificate_stats(_=Depends(require_admin)):
                                  f"the migration?): {getattr(e, 'message', str(e))}")
 
     emails = [r["email"] for r in requests_rows]
-    participants = (supabase.table("participants")
-        .select("id, first_name, last_name, email, phone")
-        .in_("email", emails).execute().data) if emails else []
+    participants = _batch_in_filter(
+        supabase.table("participants"),
+        "email", emails,
+        select="id, first_name, last_name, email, phone",
+    ) if emails else []
     email_to_p = {p["email"]: p for p in participants}
 
     pids = [p["id"] for p in participants]
-    eps = (supabase.table("event_participants")
-        .select("id, participant_id, cert_sent")
-        .eq("event_id", EVENT_ID)
-        .in_("participant_id", pids).execute().data) if pids else []
+    eps = _batch_in_filter(
+        supabase.table("event_participants"),
+        "participant_id", pids,
+        select="id, participant_id, cert_sent",
+        eq=("event_id", EVENT_ID),
+    ) if pids else []
     pid_to_ep = {e["participant_id"]: e for e in eps}
 
     ep_ids = [e["id"] for e in eps]
-    checkins = (supabase.table("checkins")
-        .select("event_participant_id")
-        .eq("event_id", EVENT_ID)
-        .in_("event_participant_id", ep_ids).execute().data) if ep_ids else []
+    checkins = _batch_in_filter(
+        supabase.table("checkins"),
+        "event_participant_id", ep_ids,
+        select="event_participant_id",
+        eq=("event_id", EVENT_ID),
+    ) if ep_ids else []
     attended_ep_ids = {c["event_participant_id"] for c in checkins if c.get("event_participant_id")}
 
     responses = []
