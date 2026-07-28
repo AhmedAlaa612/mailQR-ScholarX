@@ -967,6 +967,34 @@ def admin_certificate_send(ep_id: str, _=Depends(require_admin)):
     return {"status": "sent", "name": full_name}
 
 
+class ParticipantNameUpdate(BaseModel):
+    name: str
+
+
+@app.patch("/api/admin/participants/{ep_id}/name")
+def admin_update_participant_name(ep_id: str, body: ParticipantNameUpdate,
+                                  _=Depends(require_admin)):
+    """Fix the spelling of a participant's name from the admin tables, so the
+    certificate is issued with the name they actually asked for. The single
+    `name` string is split on the first space into first/last."""
+    name = " ".join((body.name or "").split())
+    if not name:
+        raise HTTPException(422, "Name cannot be empty")
+
+    ep_rows = (supabase.table("event_participants")
+        .select("id, participant_id, event_id")
+        .eq("id", ep_id).limit(1).execute().data)
+    if not ep_rows or ep_rows[0].get("event_id") != EVENT_ID:
+        raise HTTPException(404, "Registration not found")
+
+    first, _sep, last = name.partition(" ")
+    (supabase.table("participants")
+        .update({"first_name": first, "last_name": last or None})
+        .eq("id", ep_rows[0]["participant_id"]).execute())
+
+    return {"status": "updated", "ep_id": ep_id, "name": name}
+
+
 # ── Check-in app additions (developer-plan.md) ───────────────────
 
 from collections import defaultdict
