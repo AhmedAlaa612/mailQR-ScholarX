@@ -995,6 +995,38 @@ def admin_update_participant_name(ep_id: str, body: ParticipantNameUpdate,
     return {"status": "updated", "ep_id": ep_id, "name": name}
 
 
+class ParticipantEmailUpdate(BaseModel):
+    email: str
+
+
+@app.patch("/api/admin/participants/{ep_id}/email")
+def admin_update_participant_email(ep_id: str, body: ParticipantEmailUpdate,
+                                   _=Depends(require_admin)):
+    """Fix a mistyped email address from the admin tables — this is where
+    the certificate/QR actually get sent, so a typo here means it goes
+    nowhere."""
+    email = clean_email(body.email)
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(422, "That doesn't look like a valid email address")
+
+    ep_rows = (supabase.table("event_participants")
+        .select("id, participant_id, event_id")
+        .eq("id", ep_id).limit(1).execute().data)
+    if not ep_rows or ep_rows[0].get("event_id") != EVENT_ID:
+        raise HTTPException(404, "Registration not found")
+
+    try:
+        (supabase.table("participants")
+            .update({"email": email})
+            .eq("id", ep_rows[0]["participant_id"]).execute())
+    except PostgrestAPIError as e:
+        if "duplicate" in str(getattr(e, "message", e)).lower():
+            raise HTTPException(409, "Another participant already uses that email")
+        raise HTTPException(500, f"email update failed: {getattr(e, 'message', str(e))}")
+
+    return {"status": "updated", "ep_id": ep_id, "email": email}
+
+
 # ── Check-in app additions (developer-plan.md) ───────────────────
 
 from collections import defaultdict
