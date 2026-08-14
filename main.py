@@ -56,6 +56,7 @@ SMTP_TIMEOUT = float(env_str("SMTP_TIMEOUT", "20") or "20")
 SMTP_SECURE  = env_bool("SMTP_SECURE", SMTP_PORT == 465)
 EVENT_ID     = env_str("EVENT_ID")   # V1 event uuid from Supabase
 ADMIN_KEY    = env_str("ADMIN_KEY")
+EVENT_SEND_QR = env_bool("EVENT_SEND_QR", True)   # false for online/no-ticket events (WhatsApp-only email)
 
 # ── Certificates ──────────────────────────────────────────────
 CERT_SECRET       = env_str("CERT_SECRET")               # shared secret with the Apps Script
@@ -262,25 +263,37 @@ def smtp_send_message(msg: MIMEMultipart, to_email: str):
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, to_email, msg.as_string())
 
-def send_email(to_email: str, first_name: str, qr_bytes: bytes):
-    body = (
-        f"Hey {first_name}, thanks for registering for the Next Scholar Summit!\n\n"
-        f"Your QR code is attached — keep it ready at the event entrance.\n\n"
-        f"Don't forget to join the event's WhatsApp group for updates and announcements:\n"
-        f"https://chat.whatsapp.com/ISiThrqvB4b5jW868Bg9Vh\n\n\n"
-        f"See you there,\n"
-        f"ScholarX Team"
-    )
+def send_email(to_email: str, first_name: str, qr_bytes: bytes, with_qr: bool = True):
+    if with_qr:
+        body = (
+            f"Hey {first_name}, thanks for registering for the Next Scholar Summit!\n\n"
+            f"Your QR code is attached — keep it ready at the event entrance.\n\n"
+            f"Don't forget to join the event's WhatsApp group for updates and announcements:\n"
+            f"https://chat.whatsapp.com/ISiThrqvB4b5jW868Bg9Vh\n\n\n"
+            f"See you there,\n"
+            f"ScholarX Team"
+        )
+        subject = "Your QR Code Ticket — Next Scholar Summit"
+    else:
+        body = (
+            f"Hey {first_name}, thanks for registering for the Scholarships session with ScholarX!\n\n"
+            f"Please join this WhatsApp group for updates:\n"
+            f"https://chat.whatsapp.com/ISiThrqvB4b5jW868Bg9Vh\n\n\n"
+            f"See you there,\n"
+            f"ScholarX Team"
+        )
+        subject = "ScholarX Scholarships Session — WhatsApp Group"
 
     msg = MIMEMultipart()
     msg["From"]    = SMTP_FROM or f"{FROM_NAME} <{SMTP_USER}>"
     msg["To"]      = to_email
-    msg["Subject"] = "Your QR Code Ticket — Next Scholar Summit"
+    msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    img_part = MIMEImage(qr_bytes, name="ticket.png")
-    img_part.add_header("Content-Disposition", "attachment", filename="ticket.png")
-    msg.attach(img_part)
+    if with_qr:
+        img_part = MIMEImage(qr_bytes, name="ticket.png")
+        img_part.add_header("Content-Disposition", "attachment", filename="ticket.png")
+        msg.attach(img_part)
 
     smtp_send_message(msg, to_email)
 
@@ -404,7 +417,7 @@ async def register(payload: RegistrationPayload):
 
     # Send email
     try:
-        send_email(email, first_name, qr_bytes)
+        send_email(email, first_name, qr_bytes, with_qr=EVENT_SEND_QR)
         mark_qr_sent(ep_id)
         email_status = "sent"
     except Exception as e:

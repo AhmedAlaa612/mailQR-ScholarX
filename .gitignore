@@ -48,6 +48,14 @@ qr_codes/
 # Certificate test output
 cert_test_output/
 
+# Sensitive credential/data exports
+*credentials*.csv
+*_sent.csv
+volunteers.csv
+volunteers-credentials.csv
+high_board.csv
+media_volunteers.csv
+
 # Logs
 *.log
 
