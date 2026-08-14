@@ -278,7 +278,7 @@ def send_email(to_email: str, first_name: str, qr_bytes: bytes, with_qr: bool = 
         body = (
             f"Hey {first_name}, thanks for registering for the Scholarships session with ScholarX!\n\n"
             f"Please join this WhatsApp group for updates:\n"
-            f"https://chat.whatsapp.com/ISiThrqvB4b5jW868Bg9Vh\n\n\n"
+            f"https://chat.whatsapp.com/JDb6nfBimcN9R6Js6uLy8M?s=cl&p=a&ilr=1\n\n\n"
             f"See you there,\n"
             f"ScholarX Team"
         )
