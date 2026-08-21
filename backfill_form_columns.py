@@ -12,7 +12,10 @@ so participants.city holds the goals answer, participants.affiliation holds
 the session question, and the real governorate was discarded.
 
 This script re-reads the responses sheet and writes the correct city and
-affiliation back onto participants, matched by email.
+affiliation back onto participants, matched by email. Emails are normalized
+with main.clean_email, because that is what the API stored: a registrant who
+typed "@gamil.com" is in the database as "@gmail.com", and matching on the raw
+sheet value would skip them.
 
 It deliberately does NOT go through /api/register: that endpoint sends a
 ticket email and inserts a new event_participants row on every call, so
@@ -84,14 +87,16 @@ def cell(row, index):
     return str(row[index]).strip()
 
 
-def build_updates(headers, rows):
+def build_updates(headers, rows, clean_email):
     """Return {email: {city, affiliation}}, last submission per email winning."""
     col = resolve_columns(headers)
     updates = {}
     for row in rows:
-        email = cell(row, col.get("email")).lower()
-        if not email:
+        raw_email = cell(row, col.get("email"))
+        if not raw_email:
             continue
+        # Match the normalization the API applied before inserting the row.
+        email = clean_email(raw_email)
 
         university = cell(row, col.get("university"))
         college = cell(row, col.get("college"))
@@ -112,7 +117,7 @@ def build_updates(headers, rows):
     return updates
 
 
-def main():
+def run():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sheet", help="Responses sheet exported as .xlsx")
     parser.add_argument(
@@ -126,8 +131,12 @@ def main():
     if not url or not key:
         sys.exit("SUPABASE_URL and SUPABASE_KEY must be set.")
 
+    # Reuse the API's own cleaner so the two can never drift apart.
+    # Importing main requires the Supabase env vars checked just above.
+    from main import clean_email
+
     headers, rows = read_sheet(args.sheet)
-    updates = build_updates(headers, rows)
+    updates = build_updates(headers, rows, clean_email)
     print(f"{len(rows)} responses -> {len(updates)} unique emails")
 
     supabase = create_client(url, key)
@@ -164,4 +173,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()
